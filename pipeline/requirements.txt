@@ -1,0 +1,13 @@
+# Runtime dependencies (Python 3.12)
+asyncpg==0.31.0
+codex-sdk-py==0.0.9
+jsonschema==4.26.0
+pydantic==2.13.4
+python-dotenv==1.2.2
+webvtt-py==0.5.1
+yt-dlp==2026.7.4
+
+# Development and verification
+pytest==8.4.2
+pytest-asyncio==1.4.0
+ruff==0.16.1

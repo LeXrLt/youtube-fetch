@@ -1,0 +1,47 @@
+[database]
+min_pool_size = 1
+max_pool_size = 5
+command_timeout_seconds = 30
+
+[youtube]
+cookie_file = "config/youtube.cookies.txt"
+subscription_feed_url = "https://www.youtube.com/feed/channels"
+max_videos_per_channel = 0
+socket_timeout_seconds = 30
+allow_automatic_captions = true
+exclude_auto_translated_captions = true
+format_priority = ["vtt", "json3", "srv3", "ttml", "srv2", "srv1"]
+language_priority = [
+  ["zh-Hans", "zh-CN", "zh-SG", "zh"],
+  ["zh-Hant", "zh-TW", "zh-HK", "zh-MO"],
+  ["en", "en-US", "en-GB", "en-CA", "en-AU"],
+]
+
+[agent]
+codex_path = ""
+model = ""
+reasoning_effort = "medium"
+analysis_web_search = "live"
+turn_timeout_seconds = 600
+translation_chunk_chars = 12000
+analysis_input_max_chars = 180000
+prompt_file = "config/prompts.toml"
+translation_schema_file = "config/translation.schema.json"
+analysis_schema_file = "config/analysis.schema.json"
+profile_name = "default"
+schema_version = "1"
+
+[projection]
+translated_text = "/translated_text"
+is_relevant = "/is_relevant"
+relevance_score = "/relevance_score"
+quality_score = "/quality_score"
+summary = "/summary"
+translated_summary = "/summary"
+background_notes = "/background_notes"
+key_points = "/key_points"
+tags = "/tags"
+tag_name = "/name"
+tag_category = "/category"
+tag_description = "/description"
+tag_confidence = "/confidence"

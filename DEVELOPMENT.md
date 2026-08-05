@@ -41,9 +41,9 @@ Python 中涉及 HTTP、文件和数据库的 I/O 路径应优先采用异步实
 
 Next.js App 不直接实现 `yt-dlp` 抓取逻辑，也不运行 Codex Agent；频道验证通过 Pipeline
 的 `channel-inspect` 接口完成。App 不得修改视频、字幕和分析结果。展示查询的 PostgreSQL
-连接保持只读事务；频道管理使用独立、受控的服务端写入路径，可通过
-`CHANNEL_ADMIN_POSTGRES_USER/PASSWORD` 使用最小权限凭据。数据库访问和凭据不得暴露到
-浏览器端。
+连接保持只读事务；频道管理使用独立、受控的服务端写入路径。两个路径使用 Web 自己的
+`DATABASE_URL`，该账号只需具备展示数据的查询权限以及 `youtube_channels` 的查询、新增和
+更新权限。数据库访问和凭据不得暴露到浏览器端。
 
 ### 2.3 PostgreSQL
 
@@ -61,7 +61,7 @@ YouTube -> yt-dlp -> 字幕清洗 -> Codex Agent -> PostgreSQL -> Next.js App
 
 ## 3. 环境配置
 
-根目录 `.env` 保存本地数据库连接配置：
+根目录 `.env` 保存 Pipeline 和数据库迁移脚本的本地连接配置：
 
 ```dotenv
 POSTGRES_HOST=localhost
@@ -71,13 +71,18 @@ POSTGRES_PASSWORD=hub_password
 POSTGRES_DB=youtube_fetch
 ```
 
-生产环境可额外配置 `CHANNEL_ADMIN_POSTGRES_USER` 和
-`CHANNEL_ADMIN_POSTGRES_PASSWORD`；该账号只需对 `youtube_channels` 具备查询、新增和更新
-权限。两项未配置时，开发环境兼容使用现有 `POSTGRES_*` 账号。
-
 其中 `youtube_fetch` 是本项目使用的数据库名。`.env` 仅用于本地运行，不应提交
 真实生产凭据。部署到其他设备时，可以生成本机 `.env`，也可以直接提供全部必需的
 `POSTGRES_*` 环境变量。两者同时存在时，进程环境变量优先。
+
+Web 不加载上述根目录 `.env`，只读取 `DATABASE_URL`。本地值保存在 `web/.env.local`：
+
+```dotenv
+DATABASE_URL=postgresql://hub_user:hub_password@localhost:5432/youtube_fetch
+```
+
+`web/.env.local` 已被 Git 忽略；用户名或密码包含 URL 保留字符时必须进行百分号编码。
+生产环境也可以直接向 Web 进程提供 `DATABASE_URL`，进程环境变量优先于 `.env.local`。
 
 YouTube 登录状态使用 Netscape 格式 Cookie 文件，默认路径为
 `pipeline/config/youtube.cookies.txt`，可通过 `YOUTUBE_COOKIE_FILE` 覆盖。该文件已被
@@ -216,7 +221,7 @@ PGPASSWORD="$POSTGRES_PASSWORD" psql \
 ```
 
 Next.js App 的安装、运行和校验命令见 [`web/README.md`](web/README.md)。本地启动前先
-执行迁移，再从 `web/` 运行 `npm install` 和 `npm run dev`；应用会加载根目录 `.env`。
+执行迁移，配置 `web/.env.local`，再从 `web/` 运行 `npm install` 和 `npm run dev`。
 
 ## 7. 后续开发约束
 

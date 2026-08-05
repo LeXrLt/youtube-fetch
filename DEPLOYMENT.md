@@ -11,7 +11,7 @@
 
 ## 配置
 
-在项目根目录创建 `.env`：
+在项目根目录创建供 Pipeline 和迁移脚本使用的 `.env`：
 
 ```dotenv
 POSTGRES_HOST=127.0.0.1
@@ -21,12 +21,14 @@ POSTGRES_PASSWORD=your_password
 POSTGRES_DB=youtube_fetch
 ```
 
-生产环境可另行提供最小权限的频道管理账号：
+Web 不读取根目录 `.env`。在 `web/.env.local` 中配置独立的连接 URL：
 
 ```dotenv
-CHANNEL_ADMIN_POSTGRES_USER=channel_admin
-CHANNEL_ADMIN_POSTGRES_PASSWORD=channel_admin_password
+DATABASE_URL=postgresql://hub_user:hub_password@localhost:5432/youtube_fetch
 ```
+
+该 URL 中的账号需要具备展示数据的查询权限，以及 `youtube_channels` 的查询、新增和更新
+权限。生产环境也可以直接向 Web 进程提供 `DATABASE_URL`；不得提交真实凭据。
 
 将 YouTube Cookie 写入 `pipeline/config/youtube.cookies.txt`，并限制文件权限：
 

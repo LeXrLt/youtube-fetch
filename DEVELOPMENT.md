@@ -141,6 +141,11 @@ set -e
 新增部署编排、systemd、容器 entrypoint 或 CI/CD workflow 时，必须把该命令接入其
 pre-deploy 阶段，不能依赖开发者手工执行 SQL。
 
+`run` 与 `video` 在业务数据库上持有同一个 PostgreSQL 会话级 advisory lock。锁使用独立
+连接，不占用 asyncpg 业务连接池；竞争任务必须立即失败而不是等待。锁连接关闭时由
+PostgreSQL 自动释放，因此不得将其改为可能遗留陈旧状态的普通标记行或 PID 文件。
+频道管理和只读检查命令不使用该锁，避免长时间抓取阻断 Web 的频道管理流程。
+
 ### 4.2 迁移规则
 
 - 已应用的迁移不可修改；`001_init.sql` 应视为不可变历史。

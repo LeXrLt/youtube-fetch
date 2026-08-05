@@ -87,6 +87,11 @@ pipeline/.venv/bin/python pipeline/main.py channel-inspect '@example'
 其他数据库相关命令在执行业务操作前都会自动运行 `db/migrate.sh`；迁移失败时业务操作
 不会开始。
 
+`run` 和 `video` 使用 PostgreSQL 会话级 advisory lock，同一个项目数据库同一时间只允许
+一个高资源 Pipeline 任务运行。若锁已被其他进程持有，新任务会立即退出，不会排队；任务
+正常结束、异常退出、进程崩溃或数据库连接断开后，PostgreSQL 会自动释放锁。
+`config-check`、`migrate`、`channel-inspect` 和 `channel-add` 不占用该运行锁。
+
 ```bash
 # 仅创建数据库并应用全部未执行迁移
 pipeline/.venv/bin/python pipeline/main.py migrate

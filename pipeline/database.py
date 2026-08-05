@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
@@ -25,6 +26,10 @@ class DatabaseNotStartedError(RuntimeError):
     """Raised when a repository method is used before connecting."""
 
 
+class PipelineAlreadyRunningError(RuntimeError):
+    """Raised when another resource-intensive Pipeline command holds the lock."""
+
+
 class PipelineRepository:
     def __init__(self, settings: DatabaseSettings) -> None:
         self._settings = settings
@@ -46,6 +51,37 @@ class PipelineRepository:
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
+
+    @asynccontextmanager
+    async def process_lock(self) -> AsyncIterator[None]:
+        # A dedicated session keeps the lock independent from pool size and resets.
+        connection = await asyncpg.connect(
+            host=self._settings.host,
+            port=self._settings.port,
+            user=self._settings.user,
+            password=self._settings.password.get_secret_value(),
+            database=self._settings.database,
+            command_timeout=self._settings.command_timeout_seconds,
+        )
+        try:
+            acquired = await connection.fetchval(
+                """
+                SELECT pg_try_advisory_lock(
+                    hashtextextended(current_database() || ':pipeline_process', 0)
+                )
+                """
+            )
+            if acquired is not True:
+                raise PipelineAlreadyRunningError(
+                    "Another resource-intensive Pipeline process is already running"
+                )
+            yield
+        finally:
+            try:
+                await connection.close()
+            finally:
+                if not connection.is_closed():
+                    connection.terminate()
 
     async def list_active_channels(self) -> list[ChannelRecord]:
         rows = await self._require_pool().fetch(

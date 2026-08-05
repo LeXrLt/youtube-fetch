@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -16,7 +17,7 @@ import pytest_asyncio
 from dotenv import dotenv_values
 
 from config import DatabaseSettings
-from database import PipelineRepository
+from database import PipelineAlreadyRunningError, PipelineRepository
 from models import (
     AgentInvocation,
     AnalysisOutcome,
@@ -106,6 +107,66 @@ async def repository() -> AsyncIterator[PipelineRepository]:
                         await admin.execute(f'DROP DATABASE IF EXISTS "{database_name}"')
             finally:
                 await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_repository_process_lock_is_exclusive_and_released(
+    repository: PipelineRepository,
+) -> None:
+    single_connection_repository = PipelineRepository(
+        repository._settings.model_copy(
+            update={"min_pool_size": 1, "max_pool_size": 1}
+        )
+    )
+    await single_connection_repository.connect()
+    try:
+        async with single_connection_repository.process_lock():
+            assert (
+                await single_connection_repository._require_pool().fetchval("SELECT 1")
+                == 1
+            )
+            with pytest.raises(PipelineAlreadyRunningError, match="already running"):
+                async with repository.process_lock():
+                    pytest.fail("A concurrent process lock must not be acquired")
+
+        with pytest.raises(RuntimeError, match="lock body failed"):
+            async with single_connection_repository.process_lock():
+                raise RuntimeError("lock body failed")
+
+        async with single_connection_repository.process_lock():
+            assert (
+                await single_connection_repository._require_pool().fetchval("SELECT 1")
+                == 1
+            )
+    finally:
+        await single_connection_repository.close()
+
+
+@pytest.mark.asyncio
+async def test_repository_process_lock_is_released_on_cancellation(
+    repository: PipelineRepository,
+) -> None:
+    acquired = asyncio.Event()
+    blocker = asyncio.Event()
+
+    async def hold_lock() -> None:
+        async with repository.process_lock():
+            acquired.set()
+            await blocker.wait()
+
+    holder = asyncio.create_task(hold_lock())
+    try:
+        await acquired.wait()
+        with pytest.raises(PipelineAlreadyRunningError, match="already running"):
+            async with repository.process_lock():
+                pytest.fail("A concurrent process lock must not be acquired")
+    finally:
+        holder.cancel()
+        with suppress(asyncio.CancelledError):
+            await holder
+
+    async with repository.process_lock():
+        assert await repository._require_pool().fetchval("SELECT 1") == 1
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
@@ -13,11 +14,12 @@ from yt_dlp.utils import DownloadError
 from agent import CodexStructuredAgent
 from analysis import AnalysisEngine
 from config import DEFAULT_CONFIG_PATH, RuntimeSettings, load_settings
-from database import PipelineRepository
+from database import PipelineAlreadyRunningError, PipelineRepository
 from service import PipelineService
 from youtube import YoutubeClient, YoutubeMetadataError
 
 LOGGER = logging.getLogger(__name__)
+PROCESS_LOCK_COMMANDS = frozenset({"run", "video"})
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -122,34 +124,40 @@ async def _run(args: argparse.Namespace) -> int:
         return 0
 
     repository = PipelineRepository(settings.database)
-    await repository.connect()
-    try:
-        service = _service(settings, repository)
-        if args.command == "channel-add":
-            channel_id = await service.add_channel(args.channel_url, args.researcher)
-            print(json.dumps({"channel_id": str(channel_id)}, ensure_ascii=False))
-            return 0
-        if args.command == "video":
-            result = await service.process_video(args.video_url, force=args.force)
-            print(json.dumps(asdict(result), ensure_ascii=False))
-            return 0
-        if args.command == "run":
-            max_videos = (
-                args.max_videos_per_channel
-                if args.max_videos_per_channel is not None
-                else settings.youtube.max_videos_per_channel
-            )
-            if max_videos < 0:
-                raise ValueError("max-videos-per-channel must not be negative")
-            results = await service.run_channels(
-                args.channel,
-                max_videos_per_channel=max_videos or None,
-                force=args.force,
-            )
-            print(json.dumps([asdict(result) for result in results], ensure_ascii=False))
-            return 1 if any(result.status == "failed" for result in results) else 0
-    finally:
-        await repository.close()
+    lock_context = (
+        repository.process_lock()
+        if args.command in PROCESS_LOCK_COMMANDS
+        else nullcontext()
+    )
+    async with lock_context:
+        try:
+            await repository.connect()
+            service = _service(settings, repository)
+            if args.command == "channel-add":
+                channel_id = await service.add_channel(args.channel_url, args.researcher)
+                print(json.dumps({"channel_id": str(channel_id)}, ensure_ascii=False))
+                return 0
+            if args.command == "video":
+                result = await service.process_video(args.video_url, force=args.force)
+                print(json.dumps(asdict(result), ensure_ascii=False))
+                return 0
+            if args.command == "run":
+                max_videos = (
+                    args.max_videos_per_channel
+                    if args.max_videos_per_channel is not None
+                    else settings.youtube.max_videos_per_channel
+                )
+                if max_videos < 0:
+                    raise ValueError("max-videos-per-channel must not be negative")
+                results = await service.run_channels(
+                    args.channel,
+                    max_videos_per_channel=max_videos or None,
+                    force=args.force,
+                )
+                print(json.dumps([asdict(result) for result in results], ensure_ascii=False))
+                return 1 if any(result.status == "failed" for result in results) else 0
+        finally:
+            await repository.close()
 
     raise RuntimeError(f"Unsupported command: {args.command}")
 
@@ -165,6 +173,9 @@ def main() -> None:
         raise SystemExit(asyncio.run(_run(args)))
     except KeyboardInterrupt:
         raise SystemExit(130) from None
+    except PipelineAlreadyRunningError as exc:
+        LOGGER.error("%s", exc)
+        raise SystemExit(1) from None
     except Exception:
         LOGGER.exception("Pipeline command failed")
         raise SystemExit(1) from None

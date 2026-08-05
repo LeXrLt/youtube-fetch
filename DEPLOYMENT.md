@@ -69,4 +69,7 @@ cd web
 npm run start -- --hostname 0.0.0.0 --port 3000
 ```
 
-生产环境中应使用外部调度器周期运行 Pipeline，并使用进程管理器保持 Web 服务常驻。若需要在 Web 中新增频道，必须保留 `pipeline/.venv` 和私有 YouTube Cookie；仅作只读展示时可跳过 Pipeline 的安装和运行。
+生产环境中应使用外部调度器周期运行 Pipeline，并使用进程管理器保持 Web 服务常驻。
+`run` 和 `video` 通过 PostgreSQL advisory lock 防止任务重叠；调度器触发重叠任务时，后者
+会立即失败且不会排队。若需要在 Web 中新增频道，必须保留 `pipeline/.venv` 和私有
+YouTube Cookie；仅作只读展示时可跳过 Pipeline 的安装和运行。

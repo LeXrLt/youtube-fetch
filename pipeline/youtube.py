@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote, unquote, urlsplit
 
 from yt_dlp import YoutubeDL
 from yt_dlp.networking.common import Request
@@ -29,6 +31,104 @@ LOGGER = logging.getLogger(__name__)
 
 class YoutubeMetadataError(ValueError):
     """Raised when yt-dlp does not return required YouTube metadata."""
+
+
+class YoutubeChannelReferenceError(YoutubeMetadataError):
+    """Raised when a channel reference is not an allowed YouTube channel form."""
+
+
+_YOUTUBE_CHANNEL_ID = re.compile(r"UC[A-Za-z0-9_-]{22}\Z")
+_YOUTUBE_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com"})
+_CHANNEL_ROUTE_NAMES = frozenset({"channel", "c", "user"})
+_CHANNEL_TAB_NAMES = frozenset(
+    {"about", "community", "featured", "live", "playlists", "shorts", "streams", "videos"}
+)
+_MAX_CHANNEL_REFERENCE_LENGTH = 512
+_MAX_CHANNEL_NAME_LENGTH = 100
+
+
+def normalize_channel_reference(reference: str) -> str:
+    """Return a canonical, allowlisted YouTube channel URL for a user reference."""
+
+    if not isinstance(reference, str):
+        raise YoutubeChannelReferenceError("Channel reference must be text")
+    value = reference.strip()
+    if (
+        not value
+        or len(value) > _MAX_CHANNEL_REFERENCE_LENGTH
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise YoutubeChannelReferenceError("Invalid YouTube channel reference")
+
+    if value.startswith("@"):
+        return _handle_url(value[1:])
+    if _YOUTUBE_CHANNEL_ID.fullmatch(value):
+        return f"https://www.youtube.com/channel/{value}"
+
+    lowered = value.casefold()
+    if "://" not in value and any(lowered.startswith(f"{host}/") for host in _YOUTUBE_HOSTS):
+        value = f"https://{value}"
+    elif "://" not in value:
+        return _handle_url(value)
+
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise YoutubeChannelReferenceError("Invalid YouTube channel URL") from exc
+
+    hostname = (parsed.hostname or "").rstrip(".").casefold()
+    default_port = (parsed.scheme.casefold() == "https" and port in (None, 443)) or (
+        parsed.scheme.casefold() == "http" and port in (None, 80)
+    )
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or hostname not in _YOUTUBE_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or not default_port
+    ):
+        raise YoutubeChannelReferenceError("Only YouTube channel URLs are supported")
+
+    segments = [unquote(segment) for segment in parsed.path.split("/") if segment]
+    if not segments:
+        raise YoutubeChannelReferenceError("YouTube channel URL is missing a channel")
+
+    first = segments[0]
+    if first.startswith("@"):
+        base_segments = (first,)
+        canonical = _handle_url(first[1:])
+    elif first in _CHANNEL_ROUTE_NAMES and len(segments) >= 2:
+        identifier = _channel_name(segments[1])
+        if first == "channel" and not _YOUTUBE_CHANNEL_ID.fullmatch(identifier):
+            raise YoutubeChannelReferenceError("Invalid YouTube channel ID")
+        base_segments = (first, segments[1])
+        canonical = f"https://www.youtube.com/{first}/{quote(identifier, safe='-._~')}"
+    else:
+        raise YoutubeChannelReferenceError("URL does not identify a YouTube channel")
+
+    remainder = segments[len(base_segments) :]
+    if len(remainder) > 1 or (remainder and remainder[0] not in _CHANNEL_TAB_NAMES):
+        raise YoutubeChannelReferenceError("URL does not identify a YouTube channel")
+    return canonical
+
+
+def _handle_url(handle: str) -> str:
+    normalized = _channel_name(handle)
+    return f"https://www.youtube.com/@{quote(normalized, safe='-._~')}"
+
+
+def _channel_name(value: str) -> str:
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > _MAX_CHANNEL_NAME_LENGTH
+        or "@" in normalized
+        or any(character.isspace() or character in "/\\?#" for character in normalized)
+        or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+    ):
+        raise YoutubeChannelReferenceError("Invalid YouTube channel name")
+    return normalized
 
 
 class _YtDlpLogger:
@@ -66,13 +166,18 @@ class YoutubeClient:
     ) -> list[VideoReference]:
         if limit is not None and limit < 1:
             raise ValueError("limit must be at least 1")
-        return await asyncio.to_thread(self._discover_channel_videos_sync, channel_url, limit)
+        normalized_url = normalize_channel_reference(channel_url)
+        return await asyncio.to_thread(self._discover_channel_videos_sync, normalized_url, limit)
 
     async def discover_subscribed_channels(self) -> list[ChannelMetadata]:
         return await asyncio.to_thread(self._discover_subscribed_channels_sync)
 
     async def inspect_channel(self, channel_url: str) -> ChannelMetadata:
-        return await asyncio.to_thread(self._inspect_channel_sync, channel_url)
+        normalized_url = normalize_channel_reference(channel_url)
+        channel = await asyncio.to_thread(self._inspect_channel_sync, normalized_url)
+        if not _YOUTUBE_CHANNEL_ID.fullmatch(channel.youtube_channel_id):
+            raise YoutubeMetadataError("YouTube returned an invalid channel identifier")
+        return channel
 
     def _base_options(self) -> dict[str, object]:
         return {
@@ -147,9 +252,7 @@ class YoutubeClient:
                 ("http://", "https://")
             ):
                 webpage_url = f"https://www.youtube.com/watch?v={video_id}"
-            references.append(
-                VideoReference(youtube_video_id=video_id, video_url=webpage_url)
-            )
+            references.append(VideoReference(youtube_video_id=video_id, video_url=webpage_url))
             seen_ids.add(video_id)
         return references
 
@@ -270,8 +373,7 @@ def _channel_avatar_url(
     avatar_thumbnails = [
         thumbnail
         for thumbnail in valid_thumbnails
-        if isinstance(thumbnail.get("id"), str)
-        and thumbnail.get("id", "").startswith("avatar")
+        if isinstance(thumbnail.get("id"), str) and thumbnail.get("id", "").startswith("avatar")
     ]
     if avatar_thumbnails:
         return str(avatar_thumbnails[-1]["url"]).strip()

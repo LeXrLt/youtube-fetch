@@ -69,6 +69,20 @@ export interface ChannelSummary {
   postCount: number;
 }
 
+export interface ResolvedChannel {
+  youtubeChannelId: string;
+  title: string;
+  url: string;
+  handle: string | null;
+  description: string | null;
+  avatarUrl: string | null;
+}
+
+export interface ManagedChannel extends ChannelSummary {
+  youtubeChannelId: string;
+  isActive: boolean;
+}
+
 export interface TagDetail {
   tag: TagSummary;
   posts: PaginatedResult<FeedPost>;

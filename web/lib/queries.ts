@@ -4,7 +4,7 @@ import {
   paginationOffset,
   type ParsedFeedQuery,
 } from "./query-params";
-import type { FeedMode } from "./types";
+import type { FeedMode, ResolvedChannel } from "./types";
 
 export interface SqlQuery {
   text: string;
@@ -368,6 +368,82 @@ GROUP BY
 ORDER BY post_count DESC, channel.title, channel.id
 LIMIT $1`,
     values: [limit],
+  };
+}
+
+export function buildManagedChannelsQuery(): SqlQuery {
+  return {
+    text: `WITH ${LATEST_SUBTITLES_CTE}
+SELECT
+  channel.id,
+  channel.youtube_channel_id,
+  channel.title,
+  channel.handle,
+  channel.channel_url,
+  channel.description,
+  channel.avatar_url,
+  channel.is_active,
+  count(subtitle.id) AS post_count
+FROM youtube_channels AS channel
+LEFT JOIN videos AS video ON video.channel_id = channel.id
+LEFT JOIN latest_subtitles AS subtitle ON subtitle.video_id = video.id
+GROUP BY
+  channel.id,
+  channel.youtube_channel_id,
+  channel.title,
+  channel.handle,
+  channel.channel_url,
+  channel.description,
+  channel.avatar_url,
+  channel.is_active
+ORDER BY channel.is_active DESC, channel.title, channel.id`,
+    values: [],
+  };
+}
+
+export function buildUpsertManagedChannelQuery(channel: ResolvedChannel): SqlQuery {
+  return {
+    text: `INSERT INTO youtube_channels(
+  youtube_channel_id,
+  handle,
+  title,
+  channel_url,
+  description,
+  avatar_url,
+  is_active
+)
+VALUES ($1, $2, $3, $4, $5, $6, true)
+ON CONFLICT (youtube_channel_id) DO UPDATE
+SET handle = EXCLUDED.handle,
+    title = EXCLUDED.title,
+    channel_url = EXCLUDED.channel_url,
+    description = COALESCE(EXCLUDED.description, youtube_channels.description),
+    avatar_url = COALESCE(EXCLUDED.avatar_url, youtube_channels.avatar_url),
+    is_active = true,
+    updated_at = now()
+RETURNING id`,
+    values: [
+      channel.youtubeChannelId,
+      channel.handle,
+      channel.title,
+      channel.url,
+      channel.description,
+      channel.avatarUrl,
+    ],
+  };
+}
+
+export function buildSetChannelActiveQuery(
+  channelId: string,
+  isActive: boolean,
+): SqlQuery {
+  return {
+    text: `UPDATE youtube_channels
+SET is_active = $2,
+    updated_at = now()
+WHERE id = $1::uuid
+RETURNING id`,
+    values: [channelId, isActive],
   };
 }
 

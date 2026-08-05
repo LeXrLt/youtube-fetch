@@ -76,8 +76,16 @@ pipeline/.venv/bin/python pipeline/main.py [--config PATH] [--log-level LEVEL] C
 pipeline/.venv/bin/python pipeline/main.py config-check
 ```
 
-输出当前 profile、Schema 版本和分析 Schema SHA-256。其余数据库相关命令在执行
-业务操作前都会自动运行 `db/migrate.sh`；迁移失败时业务操作不会开始。
+输出当前 profile、Schema 版本和分析 Schema SHA-256。`channel-inspect` 同样不连接或
+写入数据库，只通过 `yt-dlp` 验证频道并输出 JSON 元数据：
+
+```bash
+pipeline/.venv/bin/python pipeline/main.py channel-inspect '@example'
+```
+
+频道输入支持完整 YouTube 频道链接、`@handle`、裸 handle 和以 `UC` 开头的频道 ID。
+其他数据库相关命令在执行业务操作前都会自动运行 `db/migrate.sh`；迁移失败时业务操作
+不会开始。
 
 ```bash
 # 仅创建数据库并应用全部未执行迁移
@@ -91,7 +99,7 @@ pipeline/.venv/bin/python pipeline/main.py channel-add \
 pipeline/.venv/bin/python pipeline/main.py video \
   'https://www.youtube.com/watch?v=VIDEO_ID'
 
-# 未指定频道时，同步并处理 Cookie 登录用户的全部订阅频道
+# 未指定频道时，处理 youtube_channels 表中全部启用频道
 pipeline/.venv/bin/python pipeline/main.py run
 
 # 只处理显式频道；--channel 可重复
@@ -110,6 +118,10 @@ pipeline/.venv/bin/python pipeline/main.py run --max-videos-per-channel 5
 pipeline/.venv/bin/python pipeline/main.py video VIDEO_URL --force
 pipeline/.venv/bin/python pipeline/main.py run --force
 ```
+
+未指定 `--channel` 时，`run` 从 PostgreSQL 的 `youtube_channels` 表读取
+`is_active = true` 的频道；不会读取或同步 Cookie 登录用户的订阅列表。Web 管理页新增或
+重新启用的频道会进入默认抓取范围，停用频道及其历史数据仍保留在数据库中。
 
 默认 `max_videos_per_channel = 0`，因此首次发现频道时枚举完整视频历史；只有不限量扫描
 且本频道没有失败时，才会记录首次回填完成时间。每个视频的元数据、字幕、翻译和分析

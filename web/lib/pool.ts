@@ -12,14 +12,18 @@ const POSTGRES_ENV_NAMES = [
   "POSTGRES_USER",
   "POSTGRES_PASSWORD",
   "POSTGRES_DB",
+  "CHANNEL_ADMIN_POSTGRES_USER",
+  "CHANNEL_ADMIN_POSTGRES_PASSWORD",
 ] as const;
 
 type PoolGlobal = typeof globalThis & {
   __youtubeFetchReadOnlyPool?: Pool;
+  __youtubeFetchChannelManagementPool?: Pool;
 };
 
 const poolGlobal = globalThis as PoolGlobal;
-let productionPool: Pool | undefined;
+let productionReadOnlyPool: Pool | undefined;
+let productionChannelManagementPool: Pool | undefined;
 
 function requiredEnv(name: string, trim = true): string {
   const value = process.env[name];
@@ -30,7 +34,7 @@ function requiredEnv(name: string, trim = true): string {
   return normalized;
 }
 
-function databaseConfig(): PoolConfig {
+function loadDatabaseEnvironment(): void {
   const processOverrides = new Map(
     POSTGRES_ENV_NAMES.flatMap((name) =>
       Object.hasOwn(process.env, name) ? [[name, process.env[name]]] : [],
@@ -49,6 +53,12 @@ function databaseConfig(): PoolConfig {
       process.env[name] = value;
     }
   }
+}
+
+function databaseConfig(
+  access: "read-only" | "channel-management",
+): PoolConfig {
+  loadDatabaseEnvironment();
 
   const rawPort = requiredEnv("POSTGRES_PORT");
   const port = Number(rawPort);
@@ -56,15 +66,33 @@ function databaseConfig(): PoolConfig {
     throw new Error("POSTGRES_PORT must be an integer between 1 and 65535");
   }
 
+  const managementUser = process.env.CHANNEL_ADMIN_POSTGRES_USER?.trim();
+  const managementPassword = process.env.CHANNEL_ADMIN_POSTGRES_PASSWORD;
+  if (Boolean(managementUser) !== Boolean(managementPassword)) {
+    throw new Error(
+      "CHANNEL_ADMIN_POSTGRES_USER and CHANNEL_ADMIN_POSTGRES_PASSWORD must be configured together",
+    );
+  }
+
   return {
     host: requiredEnv("POSTGRES_HOST"),
     port,
-    user: requiredEnv("POSTGRES_USER"),
-    password: requiredEnv("POSTGRES_PASSWORD", false),
+    user:
+      access === "channel-management" && managementUser
+        ? managementUser
+        : requiredEnv("POSTGRES_USER"),
+    password:
+      access === "channel-management" && managementPassword
+        ? managementPassword
+        : requiredEnv("POSTGRES_PASSWORD", false),
     database: requiredEnv("POSTGRES_DB"),
-    application_name: "youtube-fetch-web",
-    options: "-c default_transaction_read_only=on",
-    max: 5,
+    application_name:
+      access === "read-only"
+        ? "youtube-fetch-web"
+        : "youtube-fetch-web-channel-management",
+    options:
+      access === "read-only" ? "-c default_transaction_read_only=on" : undefined,
+    max: access === "read-only" ? 5 : 2,
     min: 0,
     connectionTimeoutMillis: 10_000,
     idleTimeoutMillis: 30_000,
@@ -74,20 +102,32 @@ function databaseConfig(): PoolConfig {
   };
 }
 
-function createPool(): Pool {
-  const pool = new Pool(databaseConfig());
+function createPool(access: "read-only" | "channel-management"): Pool {
+  const pool = new Pool(databaseConfig(access));
   pool.on("error", (error) => {
-    console.error("Unexpected idle PostgreSQL client error", error);
+    console.error(`Unexpected idle PostgreSQL ${access} client error`, error);
   });
   return pool;
 }
 
 export function getReadOnlyPool(): Pool {
   if (process.env.NODE_ENV !== "production") {
-    poolGlobal.__youtubeFetchReadOnlyPool ??= createPool();
+    poolGlobal.__youtubeFetchReadOnlyPool ??= createPool("read-only");
     return poolGlobal.__youtubeFetchReadOnlyPool;
   }
 
-  productionPool ??= createPool();
-  return productionPool;
+  productionReadOnlyPool ??= createPool("read-only");
+  return productionReadOnlyPool;
+}
+
+export function getChannelManagementPool(): Pool {
+  if (process.env.NODE_ENV !== "production") {
+    poolGlobal.__youtubeFetchChannelManagementPool ??= createPool(
+      "channel-management",
+    );
+    return poolGlobal.__youtubeFetchChannelManagementPool;
+  }
+
+  productionChannelManagementPool ??= createPool("channel-management");
+  return productionChannelManagementPool;
 }

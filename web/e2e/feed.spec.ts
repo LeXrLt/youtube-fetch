@@ -52,3 +52,29 @@ test("shows the stored channel profile without horizontal overflow", async ({ pa
   );
   expect(overflow).toBeLessThanOrEqual(1);
 });
+
+test("manages channels and reports an unknown channel inline", async ({ page }) => {
+  await page.goto("/channels");
+
+  await expect(page.getByRole("heading", { name: "频道", level: 1 })).toBeVisible();
+  await expect(page.getByRole("link", { name: "频道", exact: true })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
+
+  const firstChannel = page.locator(".channel-management-row").first();
+  await expect(firstChannel).toBeVisible();
+  await expect(firstChannel.getByRole("switch")).toBeVisible();
+  await expect(firstChannel.locator(".channel-management-id")).toContainText(/^UC/);
+
+  await page
+    .getByRole("textbox", { name: "频道链接或用户 ID" })
+    .fill("invalid channel reference");
+  await page.getByRole("button", { name: "确认" }).click();
+  await expect(page.locator("#channel-add-message")).toHaveText("频道不存在！");
+
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+  expect(overflow).toBeLessThanOrEqual(1);
+});

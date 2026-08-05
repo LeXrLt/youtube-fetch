@@ -8,6 +8,7 @@ import { PAGE_SIZE, isUuid, parseFeedQuery } from "./query-params";
 import {
   buildChannelSummaryQuery,
   buildFeedQueries,
+  buildManagedChannelsQuery,
   buildSidebarChannelsQuery,
   buildTagFeedQueries,
   buildTagSummaryQuery,
@@ -23,6 +24,7 @@ import type {
   FeedPost,
   FeedQueryInput,
   FeedTag,
+  ManagedChannel,
   PaginatedResult,
   SidebarData,
   TagDetail,
@@ -39,6 +41,7 @@ export type {
   FeedPost,
   FeedQueryInput,
   FeedTag,
+  ManagedChannel,
   PaginatedResult,
   SidebarData,
   TagDetail,
@@ -90,6 +93,11 @@ interface ChannelSummaryRow extends QueryResultRow {
   description: string | null;
   avatar_url: string | null;
   post_count: string | number;
+}
+
+interface ManagedChannelRow extends ChannelSummaryRow {
+  youtube_channel_id: string;
+  is_active: boolean;
 }
 
 function numericCount(value: string | number): number {
@@ -188,6 +196,14 @@ function channelSummary(row: ChannelSummaryRow): ChannelSummary {
   };
 }
 
+function managedChannel(row: ManagedChannelRow): ManagedChannel {
+  return {
+    ...channelSummary(row),
+    youtubeChannelId: row.youtube_channel_id,
+    isActive: row.is_active,
+  };
+}
+
 async function runtimePool(): Promise<Pool> {
   await connection();
   return getReadOnlyPool();
@@ -241,6 +257,13 @@ export async function getOriginalFeed(
 export async function getTags(): Promise<TagSummary[]> {
   const pool = await runtimePool();
   return (await query<TagSummaryRow>(pool, buildTagsQuery())).map(tagSummary);
+}
+
+export async function getManagedChannels(): Promise<ManagedChannel[]> {
+  const pool = await runtimePool();
+  return (await query<ManagedChannelRow>(pool, buildManagedChannelsQuery())).map(
+    managedChannel,
+  );
 }
 
 export async function getTagDetail(

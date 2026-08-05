@@ -220,15 +220,17 @@ class PipelineService:
         max_videos_per_channel: int | None,
         force: bool,
     ) -> list[ProcessResult]:
-        if channel_urls:
-            channel_ids = [
-                await self.add_channel(channel_url, researcher_name=None)
-                for channel_url in dict.fromkeys(channel_urls)
-            ]
-            channels = await self._repository.get_channels(_unique(channel_ids))
-        else:
-            subscriptions = await self._youtube.discover_subscribed_channels()
-            channels = await self._repository.sync_subscribed_channels(subscriptions)
+        if not channel_urls:
+            return await self.run_all_channels(
+                max_videos_per_channel=max_videos_per_channel,
+                force=force,
+            )
+
+        channel_ids = [
+            await self.add_channel(channel_url, researcher_name=None)
+            for channel_url in dict.fromkeys(channel_urls)
+        ]
+        channels = await self._repository.get_channels(_unique(channel_ids))
 
         return await self._process_channels(
             channels,

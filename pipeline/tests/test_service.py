@@ -164,10 +164,8 @@ def _channel_record() -> ChannelRecord:
 @dataclass
 class FakeYoutube:
     fetched: FetchedVideo
-    subscriptions: list[ChannelMetadata] = field(default_factory=list)
     references: list[VideoReference] = field(default_factory=list)
     failing_channel_urls: set[str] = field(default_factory=set)
-    fail_subscription_discovery: bool = False
     calls: list[tuple[str, tuple[Any, ...]]] = field(default_factory=list)
 
     async def fetch_video(self, video_url: str) -> FetchedVideo:
@@ -178,12 +176,6 @@ class FakeYoutube:
     async def inspect_channel(self, channel_url: str) -> ChannelMetadata:
         self.calls.append(("inspect_channel", (channel_url,)))
         return self.fetched.metadata.channel
-
-    async def discover_subscribed_channels(self) -> list[ChannelMetadata]:
-        self.calls.append(("discover_subscribed_channels", ()))
-        if self.fail_subscription_discovery:
-            raise RuntimeError("incomplete subscription snapshot")
-        return self.subscriptions
 
     async def discover_channel_videos(
         self,
@@ -225,11 +217,8 @@ class FakeRepository:
         self.calls.append(("get_channels", (channel_ids,), {}))
         return self.channels
 
-    async def sync_subscribed_channels(
-        self,
-        channels: list[ChannelMetadata],
-    ) -> list[ChannelRecord]:
-        self.calls.append(("sync_subscribed_channels", (channels,), {}))
+    async def list_active_channels(self) -> list[ChannelRecord]:
+        self.calls.append(("list_active_channels", (), {}))
         return self.channels
 
     async def mark_channel_backfill_completed(self, channel_id: UUID) -> None:
@@ -639,7 +628,10 @@ async def test_process_video_refetches_stored_pending_subtitle_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_without_channels_syncs_subscriptions_and_marks_full_backfill() -> None:
+@pytest.mark.parametrize("channel_urls", [None, []])
+async def test_run_without_channels_uses_active_database_channels(
+    channel_urls: list[str] | None,
+) -> None:
     fetched = _fetched_video()
     channel = _channel_record()
     repository = FakeRepository(
@@ -649,9 +641,39 @@ async def test_run_without_channels_syncs_subscriptions_and_marks_full_backfill(
     )
     youtube = FakeYoutube(
         fetched,
-        subscriptions=[fetched.metadata.channel],
         references=[VideoReference("test-video", VIDEO_URL)],
     )
+    service = PipelineService(
+        _settings(),  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        youtube,  # type: ignore[arg-type]
+        FakeAnalysis(),  # type: ignore[arg-type]
+    )
+
+    results = await service.run_channels(
+        channel_urls,
+        max_videos_per_channel=None,
+        force=False,
+    )
+
+    assert [result.status for result in results] == ["skipped"]
+    assert youtube.calls == [
+        ("discover_channel_videos", (CHANNEL_URL, None)),
+    ]
+    assert [call[0] for call in repository.calls] == [
+        "list_active_channels",
+        "get_stored_video",
+        "has_matching_analysis",
+        "mark_channel_backfill_completed",
+        "mark_channel_checked",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_without_channels_returns_empty_when_database_has_no_active_channels() -> None:
+    fetched = _fetched_video()
+    repository = FakeRepository()
+    youtube = FakeYoutube(fetched)
     service = PipelineService(
         _settings(),  # type: ignore[arg-type]
         repository,  # type: ignore[arg-type]
@@ -665,41 +687,9 @@ async def test_run_without_channels_syncs_subscriptions_and_marks_full_backfill(
         force=False,
     )
 
-    assert [result.status for result in results] == ["skipped"]
-    assert youtube.calls == [
-        ("discover_subscribed_channels", ()),
-        ("discover_channel_videos", (CHANNEL_URL, None)),
-    ]
-    assert [call[0] for call in repository.calls] == [
-        "sync_subscribed_channels",
-        "get_stored_video",
-        "has_matching_analysis",
-        "mark_channel_backfill_completed",
-        "mark_channel_checked",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_failed_subscription_snapshot_does_not_change_database_state() -> None:
-    fetched = _fetched_video()
-    repository = FakeRepository(channels=[_channel_record()])
-    youtube = FakeYoutube(fetched, fail_subscription_discovery=True)
-    service = PipelineService(
-        _settings(),  # type: ignore[arg-type]
-        repository,  # type: ignore[arg-type]
-        youtube,  # type: ignore[arg-type]
-        FakeAnalysis(),  # type: ignore[arg-type]
-    )
-
-    with pytest.raises(RuntimeError, match="incomplete subscription snapshot"):
-        await service.run_channels(
-            None,
-            max_videos_per_channel=None,
-            force=False,
-        )
-
-    assert youtube.calls == [("discover_subscribed_channels", ())]
-    assert repository.calls == []
+    assert results == []
+    assert youtube.calls == []
+    assert repository.calls == [("list_active_channels", (), {})]
 
 
 @pytest.mark.asyncio
@@ -765,7 +755,7 @@ async def test_failed_video_does_not_stop_channel_or_complete_backfill() -> None
 
 
 @pytest.mark.asyncio
-async def test_failed_channel_does_not_stop_later_subscriptions() -> None:
+async def test_failed_channel_does_not_stop_later_active_database_channels() -> None:
     fetched = _fetched_video()
     first_channel = _channel_record()
     second_channel = ChannelRecord(
@@ -779,7 +769,6 @@ async def test_failed_channel_does_not_stop_later_subscriptions() -> None:
     repository = FakeRepository(channels=[first_channel, second_channel])
     youtube = FakeYoutube(
         fetched,
-        subscriptions=[fetched.metadata.channel],
         failing_channel_urls={first_channel.channel_url},
     )
     service = PipelineService(
@@ -799,7 +788,6 @@ async def test_failed_channel_does_not_stop_later_subscriptions() -> None:
     assert results[0].status == "failed"
     assert results[0].video_url == first_channel.channel_url
     assert youtube.calls == [
-        ("discover_subscribed_channels", ()),
         ("discover_channel_videos", (first_channel.channel_url, None)),
         ("discover_channel_videos", (second_channel.channel_url, None)),
     ]
@@ -833,3 +821,9 @@ def test_run_parser_accepts_repeated_channels_and_zero_limit() -> None:
         "https://www.youtube.com/@second",
     ]
     assert args.max_videos_per_channel == 0
+
+
+def test_run_parser_defaults_to_database_channels() -> None:
+    args = _parser().parse_args(["run"])
+
+    assert args.channel == []

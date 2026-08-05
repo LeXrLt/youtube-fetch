@@ -2,8 +2,8 @@
 
 ## 1. 项目概述
 
-本项目聚合约几十位 AI 研究员的 YouTube 内容。Python Pipeline 使用
-`yt-dlp` 获取关注频道的视频元数据和字幕，再由 Codex Agent 对字幕执行过滤、
+本项目聚合约几十位 AI 研究员的 YouTube 内容。Python Pipeline 从 PostgreSQL 读取
+已启用频道，并使用 `yt-dlp` 获取视频元数据和字幕，再由 Codex Agent 对字幕执行过滤、
 翻译、背景补充、评分和标签提取。结构化结果写入 PostgreSQL，由 Next.js App
 读取并展示。
 
@@ -18,7 +18,8 @@
 
 职责：
 
-- 维护需要关注的研究员和 YouTube 频道。
+- 从 PostgreSQL 读取需要抓取的已启用 YouTube 频道。
+- 通过只读 `channel-inspect` 接口规范化频道输入并验证 YouTube 频道元数据。
 - 通过 `yt-dlp` 获取视频元数据和可用字幕。
 - 清洗、规范化字幕，保留原始字幕以便重新处理。
 - 调用 Codex Agent 完成相关性过滤、翻译、背景补充、评分和标签提取。
@@ -35,10 +36,14 @@ Python 中涉及 HTTP、文件和数据库的 I/O 路径应优先采用异步实
 - 从 PostgreSQL 读取频道资料、视频、最新字幕版本、最新成功分析和标签。
 - 以社交时间线分别展示简中翻译、任意语言原字幕和标签对应的字幕原文。
 - 提供字幕搜索、分页、标签筛选、标签详情和频道资料页。
+- 通过受控的服务端写入路径提供频道添加和启停入口，仅维护
+  `youtube_channels` 中的频道配置。
 
-Next.js App 不负责调用 `yt-dlp`、运行 Codex Agent 或实现抓取逻辑。当前产品定位
-下它是数据展示端，不应直接修改 Pipeline 的抓取和分析数据。Web 的 PostgreSQL 连接
-默认设置为只读事务，数据库访问和凭据仅存在于服务端数据访问层。
+Next.js App 不直接实现 `yt-dlp` 抓取逻辑，也不运行 Codex Agent；频道验证通过 Pipeline
+的 `channel-inspect` 接口完成。App 不得修改视频、字幕和分析结果。展示查询的 PostgreSQL
+连接保持只读事务；频道管理使用独立、受控的服务端写入路径，可通过
+`CHANNEL_ADMIN_POSTGRES_USER/PASSWORD` 使用最小权限凭据。数据库访问和凭据不得暴露到
+浏览器端。
 
 ### 2.3 PostgreSQL
 
@@ -65,6 +70,10 @@ POSTGRES_USER=hub_user
 POSTGRES_PASSWORD=hub_password
 POSTGRES_DB=youtube_fetch
 ```
+
+生产环境可额外配置 `CHANNEL_ADMIN_POSTGRES_USER` 和
+`CHANNEL_ADMIN_POSTGRES_PASSWORD`；该账号只需对 `youtube_channels` 具备查询、新增和更新
+权限。两项未配置时，开发环境兼容使用现有 `POSTGRES_*` 账号。
 
 其中 `youtube_fetch` 是本项目使用的数据库名。`.env` 仅用于本地运行，不应提交
 真实生产凭据。部署到其他设备时，可以生成本机 `.env`，也可以直接提供全部必需的
@@ -113,9 +122,10 @@ install、`src/<package>` 布局或项目 wheel。Pipeline 入口为 `pipeline/m
 
 ### 4.1 新设备部署
 
-`db/migrate.sh` 是部署前置钩子。Pipeline 已实现 `migrate`、`channel-add`、`video`
-和 `run` 命令；除无副作用的 `config-check` 外，CLI 会在数据库连接和业务操作前自动
-执行迁移。独立部署 Next.js App 时仍须在启动前显式执行迁移：
+`db/migrate.sh` 是部署前置钩子。Pipeline 已实现 `channel-inspect`、`migrate`、
+`channel-add`、`video` 和 `run` 命令；只读的 `config-check`、`channel-inspect` 不执行
+迁移，其余命令会在数据库连接和业务操作前自动执行迁移。独立部署 Next.js App 时仍须
+在启动前显式执行迁移：
 
 ```bash
 set -e

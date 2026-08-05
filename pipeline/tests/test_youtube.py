@@ -7,7 +7,14 @@ from typing import Any
 import pytest
 
 import youtube as youtube_module
-from youtube import YoutubeClient, YoutubeMetadataError
+from youtube import (
+    YoutubeChannelReferenceError,
+    YoutubeClient,
+    YoutubeMetadataError,
+    normalize_channel_reference,
+)
+
+CHANNEL_ID = "UCaaaaaaaaaaaaaaaaaaaaaa"
 
 
 class FakeYoutubeDL:
@@ -89,7 +96,7 @@ async def test_discovers_authenticated_subscriptions_with_cookie_file(
 @pytest.mark.asyncio
 async def test_inspects_channel_profile_metadata(tmp_path: Path) -> None:
     FakeYoutubeDL.payload = {
-        "channel_id": "channel-one",
+        "channel_id": CHANNEL_ID,
         "channel": "Channel One",
         "channel_url": "https://www.youtube.com/@channel-one",
         "uploader_id": "@channel-one",
@@ -111,7 +118,7 @@ async def test_inspects_channel_profile_metadata(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_inspects_channel_profile_from_playlist_metadata(tmp_path: Path) -> None:
     FakeYoutubeDL.payload = {
-        "channel_id": "channel-one",
+        "channel_id": CHANNEL_ID,
         "channel": "Channel One",
         "channel_url": "https://www.youtube.com/channel/channel-one",
         "uploader_id": "@channel-one",
@@ -142,6 +149,74 @@ async def test_inspects_channel_profile_from_playlist_metadata(tmp_path: Path) -
 
     assert channel.description == "Playlist channel description"
     assert channel.avatar_url == "https://images.test/avatar-original.jpg"
+
+
+@pytest.mark.parametrize(
+    ("reference", "expected"),
+    [
+        ("@OpenAI", "https://www.youtube.com/@OpenAI"),
+        ("OpenAI", "https://www.youtube.com/@OpenAI"),
+        (CHANNEL_ID, f"https://www.youtube.com/channel/{CHANNEL_ID}"),
+        ("youtube.com/@OpenAI/videos", "https://www.youtube.com/@OpenAI"),
+        ("https://m.youtube.com/@OpenAI?view=0", "https://www.youtube.com/@OpenAI"),
+        (
+            f"http://www.youtube.com/channel/{CHANNEL_ID}/shorts",
+            f"https://www.youtube.com/channel/{CHANNEL_ID}",
+        ),
+        ("https://www.youtube.com/user/legacy-name", "https://www.youtube.com/user/legacy-name"),
+        ("https://youtube.com/c/custom.name", "https://www.youtube.com/c/custom.name"),
+        ("研究员", "https://www.youtube.com/@%E7%A0%94%E7%A9%B6%E5%91%98"),
+    ],
+)
+def test_normalizes_supported_channel_references(reference: str, expected: str) -> None:
+    assert normalize_channel_reference(reference) == expected
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "",
+        "https://example.com/@OpenAI",
+        "https://www.youtube.com/watch?v=video",
+        "https://www.youtube.com/playlist?list=items",
+        "https://www.youtube.com/@OpenAI/videos/extra",
+        "https://user:password@www.youtube.com/@OpenAI",
+        "https://www.youtube.com:8443/@OpenAI",
+        "bad handle",
+        "name/with/slash",
+        "name\x00suffix",
+    ],
+)
+def test_rejects_unsupported_channel_references(reference: str) -> None:
+    with pytest.raises(YoutubeChannelReferenceError):
+        normalize_channel_reference(reference)
+
+
+@pytest.mark.asyncio
+async def test_inspection_normalizes_reference_before_extracting(tmp_path: Path) -> None:
+    FakeYoutubeDL.payload = {
+        "channel_id": CHANNEL_ID,
+        "channel": "Channel One",
+        "channel_url": "https://www.youtube.com/@channel-one",
+    }
+
+    await YoutubeClient(_settings(tmp_path / "cookies")).inspect_channel("@channel-one")
+
+    _, url, download = FakeYoutubeDL.calls[0]
+    assert url == "https://www.youtube.com/@channel-one"
+    assert download is False
+
+
+@pytest.mark.asyncio
+async def test_inspection_rejects_non_channel_metadata(tmp_path: Path) -> None:
+    FakeYoutubeDL.payload = {
+        "channel_id": "video-uploader",
+        "channel": "Not a channel page",
+        "channel_url": "https://www.youtube.com/@channel-one",
+    }
+
+    with pytest.raises(YoutubeMetadataError, match="channel identifier"):
+        await YoutubeClient(_settings(tmp_path / "cookies")).inspect_channel("@channel-one")
 
 
 @pytest.mark.asyncio

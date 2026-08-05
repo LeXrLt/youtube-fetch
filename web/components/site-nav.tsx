@@ -1,6 +1,6 @@
 "use client";
 
-import { Captions, House, Tags } from "lucide-react";
+import { Captions, House, Tags, UsersRound } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
@@ -17,6 +17,12 @@ const navItems = [
     label: "标签",
     icon: Tags,
     matches: (path: string) => path.startsWith("/tags"),
+  },
+  {
+    href: "/channels",
+    label: "频道",
+    icon: UsersRound,
+    matches: (path: string) => path.startsWith("/channels"),
   },
 ] as const;
 

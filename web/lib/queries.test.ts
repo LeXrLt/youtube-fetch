@@ -3,9 +3,12 @@ import { describe, expect, it } from "vitest";
 import { PAGE_SIZE, buildLikePattern } from "./query-params";
 import {
   buildFeedQueries,
+  buildManagedChannelsQuery,
+  buildSetChannelActiveQuery,
   buildTagFeedQueries,
   buildTagSummaryQuery,
   buildTagsQuery,
+  buildUpsertManagedChannelQuery,
 } from "./queries";
 
 const CHANNEL_ID = "28f5f390-62e7-4f27-a478-75d46c331b77";
@@ -78,5 +81,51 @@ describe("tag query builders", () => {
     expect(query.text).toContain("WHERE tag.id = $1::uuid");
     expect(query.text).not.toContain(TAG_ID);
     expect(query.values).toEqual([TAG_ID]);
+  });
+});
+
+describe("channel management query builders", () => {
+  it("lists active channels first without hiding inactive channels", () => {
+    const query = buildManagedChannelsQuery();
+
+    expect(query.text).toContain("channel.youtube_channel_id");
+    expect(query.text).toContain("channel.is_active");
+    expect(query.text).toContain("ORDER BY channel.is_active DESC");
+    expect(query.text).not.toContain("WHERE channel.is_active = true");
+    expect(query.values).toEqual([]);
+  });
+
+  it("parameterizes verified metadata and reactivates an existing channel", () => {
+    const channel = {
+      youtubeChannelId: "UCaaaaaaaaaaaaaaaaaaaaaa",
+      title: "Title ' OR true --",
+      url: "https://www.youtube.com/@channel",
+      handle: "@channel",
+      description: "Description",
+      avatarUrl: "https://images.example.test/avatar.jpg",
+    };
+    const query = buildUpsertManagedChannelQuery(channel);
+
+    expect(query.text).toContain("ON CONFLICT (youtube_channel_id) DO UPDATE");
+    expect(query.text).toContain("is_active = true");
+    expect(query.text).toContain("updated_at = now()");
+    expect(query.text).not.toContain(channel.title);
+    expect(query.values).toEqual([
+      channel.youtubeChannelId,
+      channel.handle,
+      channel.title,
+      channel.url,
+      channel.description,
+      channel.avatarUrl,
+    ]);
+  });
+
+  it("parameterizes channel identity and activation state", () => {
+    const query = buildSetChannelActiveQuery(CHANNEL_ID, false);
+
+    expect(query.text).toContain("WHERE id = $1::uuid");
+    expect(query.text).toContain("is_active = $2");
+    expect(query.text).not.toContain(CHANNEL_ID);
+    expect(query.values).toEqual([CHANNEL_ID, false]);
   });
 });

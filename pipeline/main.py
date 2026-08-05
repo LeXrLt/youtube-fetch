@@ -8,12 +8,14 @@ import os
 from dataclasses import asdict
 from pathlib import Path
 
+from yt_dlp.utils import DownloadError
+
 from agent import CodexStructuredAgent
 from analysis import AnalysisEngine
 from config import DEFAULT_CONFIG_PATH, RuntimeSettings, load_settings
 from database import PipelineRepository
 from service import PipelineService
-from youtube import YoutubeClient
+from youtube import YoutubeClient, YoutubeMetadataError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,8 +39,17 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("config-check", help="Validate configuration without side effects")
 
     channel_add = subparsers.add_parser("channel-add", help="Register a YouTube channel")
-    channel_add.add_argument("channel_url")
+    channel_add.add_argument("channel_url", help="YouTube channel URL, handle, or channel ID")
     channel_add.add_argument("--researcher", help="Researcher display name")
+
+    channel_inspect = subparsers.add_parser(
+        "channel-inspect",
+        help="Validate a YouTube channel and print its metadata without writing",
+    )
+    channel_inspect.add_argument(
+        "channel_reference",
+        help="YouTube channel URL, handle, or channel ID",
+    )
 
     video = subparsers.add_parser("video", help="Fetch and analyze one video")
     video.add_argument("video_url")
@@ -46,7 +57,7 @@ def _parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser(
         "run",
-        help="Process specified channels or the authenticated subscriptions",
+        help="Process specified channels or active database channels",
     )
     run.add_argument(
         "--channel",
@@ -95,6 +106,15 @@ async def _run(args: argparse.Namespace) -> int:
                 ensure_ascii=False,
             )
         )
+        return 0
+
+    if args.command == "channel-inspect":
+        try:
+            channel = await YoutubeClient(settings.youtube).inspect_channel(args.channel_reference)
+        except (DownloadError, YoutubeMetadataError):
+            print(json.dumps({"error": "channel_not_found"}, ensure_ascii=False))
+            return 2
+        print(json.dumps(asdict(channel), ensure_ascii=False))
         return 0
 
     await _migrate(settings)

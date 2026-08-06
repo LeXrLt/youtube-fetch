@@ -1,7 +1,22 @@
 import { expect, test } from "@playwright/test";
 
+import { getWebRouteKey, withWebBasePath } from "../lib/web-route";
+
+test("requires the configured route key", async ({ request }) => {
+  const rootResponse = await request.get("/");
+  expect(rootResponse.status()).toBe(404);
+  expect(await rootResponse.text()).not.toContain(getWebRouteKey());
+
+  const unprefixedResponse = await request.get("/subtitles");
+  expect(unprefixedResponse.status()).toBe(404);
+  expect(await unprefixedResponse.text()).not.toContain(getWebRouteKey());
+
+  const protectedResponse = await request.get(withWebBasePath("/"));
+  expect(protectedResponse.status()).toBe(200);
+});
+
 test("navigates the live feeds and expands a transcript", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(withWebBasePath("/"));
 
   await expect(page.getByRole("heading", { name: "首页", level: 1 })).toBeVisible();
   const firstPost = page.locator("article.transcript-post").first();
@@ -20,7 +35,7 @@ test("navigates the live feeds and expands a transcript", async ({ page }) => {
 });
 
 test("filters tags and opens the corresponding original transcript", async ({ page }) => {
-  await page.goto("/tags");
+  await page.goto(withWebBasePath("/tags"));
 
   await expect(page.getByRole("heading", { name: "标签", level: 1 })).toBeVisible();
   const firstCard = page.locator(".tag-card").first();
@@ -37,7 +52,7 @@ test("filters tags and opens the corresponding original transcript", async ({ pa
 });
 
 test("shows the stored channel profile without horizontal overflow", async ({ page }) => {
-  await page.goto("/");
+  await page.goto(withWebBasePath("/"));
 
   const firstAuthor = page.locator(".post-author").first();
   await expect(firstAuthor).toBeVisible();
@@ -54,7 +69,7 @@ test("shows the stored channel profile without horizontal overflow", async ({ pa
 });
 
 test("manages channels and reports an unknown channel inline", async ({ page }) => {
-  await page.goto("/channels");
+  await page.goto(withWebBasePath("/channels"));
 
   await expect(page.getByRole("heading", { name: "频道", level: 1 })).toBeVisible();
   await expect(page.getByRole("link", { name: "频道", exact: true })).toHaveAttribute(
@@ -77,4 +92,17 @@ test("manages channels and reports an unknown channel inline", async ({ page }) 
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
   );
   expect(overflow).toBeLessThanOrEqual(1);
+});
+
+test("keeps searches under the protected route", async ({ page }) => {
+  await page.goto(withWebBasePath("/"));
+
+  const query = "route-prefix-check";
+  await page.getByRole("searchbox", { name: "搜索字幕或博主" }).fill(query);
+  await page.getByRole("button", { name: "搜索", exact: true }).click();
+  await page.waitForURL((url) => url.searchParams.get("q") === query);
+
+  const currentUrl = new URL(page.url());
+  expect(currentUrl.pathname).toBe(withWebBasePath("/"));
+  await expect(page.getByRole("heading", { name: "首页", level: 1 })).toBeVisible();
 });

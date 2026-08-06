@@ -1,7 +1,9 @@
 import type { NextConfig } from "next";
 
+import { getWebBasePath } from "./lib/web-route";
+
 const nextConfig: NextConfig = {
-  /* config options here */
+  basePath: getWebBasePath(),
 };
 
 export default nextConfig;

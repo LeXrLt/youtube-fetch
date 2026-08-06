@@ -21,14 +21,22 @@ POSTGRES_PASSWORD=your_password
 POSTGRES_DB=youtube_fetch
 ```
 
-Web 不读取根目录 `.env`。在 `web/.env.local` 中配置独立的连接 URL：
+Web 不读取根目录 `.env`。生成一个 32 位路由密钥：
+
+```bash
+openssl rand -hex 16
+```
+
+在 `web/.env.local` 中配置独立的连接 URL 和命令生成的密钥：
 
 ```dotenv
 DATABASE_URL=postgresql://hub_user:hub_password@localhost:5432/youtube_fetch
+WEB_ROUTE_KEY=<生成的 32 位密钥>
 ```
 
 该 URL 中的账号需要具备展示数据的查询权限，以及 `youtube_channels` 的查询、新增和更新
-权限。生产环境也可以直接向 Web 进程提供 `DATABASE_URL`；不得提交真实凭据。
+权限。生产环境也可以直接通过环境变量向 Web 构建和运行进程提供 `DATABASE_URL` 与
+`WEB_ROUTE_KEY`；不得提交真实凭据或密钥。构建和运行必须使用同一个 `WEB_ROUTE_KEY`。
 
 将 YouTube Cookie 写入 `pipeline/config/youtube.cookies.txt`，并限制文件权限：
 
@@ -68,6 +76,10 @@ pipeline/.venv/bin/python pipeline/main.py run
 cd web
 npm run start -- --hostname 0.0.0.0 --port 3000
 ```
+
+Web 必须通过 `/<密钥>` 访问，根路径 `/` 返回 404。反向代理必须原样转发完整路径，不得
+剥离密钥前缀；健康检查也应请求带密钥的路径。该路由密钥适用于内部访问约束，不替代鉴权，
+不要在文档、日志或公开配置中记录实际密钥。
 
 生产环境中应使用外部调度器周期运行 Pipeline，并使用进程管理器保持 Web 服务常驻。
 `run` 和 `video` 通过 PostgreSQL advisory lock 防止任务重叠；调度器触发重叠任务时，后者

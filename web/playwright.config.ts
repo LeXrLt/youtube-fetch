@@ -1,7 +1,13 @@
+import { loadEnvConfig } from "@next/env";
 import { defineConfig, devices } from "@playwright/test";
+
+import { getWebBasePath } from "./lib/web-route";
+
+loadEnvConfig(process.cwd());
 
 const port = Number(process.env.WEB_E2E_PORT ?? 3212);
 const baseURL = `http://localhost:${port}`;
+const webBasePath = getWebBasePath();
 
 export default defineConfig({
   testDir: "./e2e",
@@ -32,7 +38,7 @@ export default defineConfig({
   ],
   webServer: {
     command: `npm run dev -- --hostname localhost --port ${port}`,
-    url: baseURL,
+    url: `${baseURL}${webBasePath}`,
     reuseExistingServer: true,
     timeout: 120_000,
   },

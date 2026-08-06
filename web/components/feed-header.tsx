@@ -1,4 +1,5 @@
 import { Search, X } from "lucide-react";
+import Form from "next/form";
 import Link from "next/link";
 
 export function FeedHeader({
@@ -34,7 +35,7 @@ export function FeedHeader({
       </div>
       {description ? <p className="timeline-description">{description}</p> : null}
       {searchable ? (
-        <form className="feed-search" action={searchAction} role="search">
+        <Form className="feed-search" action={searchAction} role="search">
           <Search size={17} aria-hidden="true" />
           <input
             type="search"
@@ -59,7 +60,7 @@ export function FeedHeader({
               <Search size={16} />
             </button>
           </span>
-        </form>
+        </Form>
       ) : null}
     </header>
   );

@@ -75,14 +75,17 @@ POSTGRES_DB=youtube_fetch
 真实生产凭据。部署到其他设备时，可以生成本机 `.env`，也可以直接提供全部必需的
 `POSTGRES_*` 环境变量。两者同时存在时，进程环境变量优先。
 
-Web 不加载上述根目录 `.env`，只读取 `DATABASE_URL`。本地值保存在 `web/.env.local`：
+Web 不加载上述根目录 `.env`，读取 `DATABASE_URL` 和 `WEB_ROUTE_KEY`。本地值保存在
+`web/.env.local`，路由密钥使用 `openssl rand -hex 16` 生成：
 
 ```dotenv
 DATABASE_URL=postgresql://hub_user:hub_password@localhost:5432/youtube_fetch
+WEB_ROUTE_KEY=<生成的 32 位密钥>
 ```
 
-`web/.env.local` 已被 Git 忽略；用户名或密码包含 URL 保留字符时必须进行百分号编码。
-生产环境也可以直接向 Web 进程提供 `DATABASE_URL`，进程环境变量优先于 `.env.local`。
+`web/.env.local` 已被 Git 忽略；用户名或密码包含 URL 保留字符时必须进行百分号编码。Web
+页面通过 `/<密钥>` 访问，根路径返回 404。生产环境也可以直接向 Web 进程提供这两个变量，
+进程环境变量优先于 `.env.local`；构建和运行必须使用相同的 `WEB_ROUTE_KEY`。
 
 YouTube 登录状态使用 Netscape 格式 Cookie 文件，默认路径为
 `pipeline/config/youtube.cookies.txt`，可通过 `YOUTUBE_COOKIE_FILE` 覆盖。该文件已被

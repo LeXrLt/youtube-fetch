@@ -22,7 +22,7 @@ language_priority = [
 
 [agent]
 codex_path = ""
-model = ""
+model = "gpt-5.6-luna"
 reasoning_effort = "medium"
 analysis_web_search = "live"
 turn_timeout_seconds = 600

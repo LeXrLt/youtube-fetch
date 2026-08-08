@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -19,19 +21,28 @@ CHANNEL_ID = "UCaaaaaaaaaaaaaaaaaaaaaa"
 
 class FakeYoutubeDL:
     payload: dict[str, Any] = {}
-    calls: list[tuple[dict[str, object], str, bool]] = []
+    calls: list[tuple[dict[str, object], str, bool, bool]] = []
+    active = False
 
     def __init__(self, options: dict[str, object]) -> None:
         self.options = options
 
     def __enter__(self) -> FakeYoutubeDL:
+        type(self).active = True
         return self
 
     def __exit__(self, *args: object) -> None:
         del args
+        type(self).active = False
 
-    def extract_info(self, url: str, *, download: bool) -> dict[str, Any]:
-        type(self).calls.append((self.options, url, download))
+    def extract_info(
+        self,
+        url: str,
+        *,
+        download: bool,
+        process: bool = True,
+    ) -> dict[str, Any]:
+        type(self).calls.append((self.options, url, download, process))
         return type(self).payload
 
 
@@ -51,7 +62,75 @@ def _settings(cookie_file: Path) -> SimpleNamespace:
 def fake_youtube_dl(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeYoutubeDL.payload = {}
     FakeYoutubeDL.calls = []
+    FakeYoutubeDL.active = False
     monkeypatch.setattr(youtube_module, "YoutubeDL", FakeYoutubeDL)
+
+
+@pytest.mark.asyncio
+async def test_blocking_call_preserves_normal_and_error_results() -> None:
+    expected_error = RuntimeError("yt-dlp failed")
+
+    assert await youtube_module._run_blocking_call(lambda: "completed") == "completed"
+
+    def fail() -> None:
+        raise expected_error
+
+    with pytest.raises(RuntimeError) as raised:
+        await youtube_module._run_blocking_call(fail)
+
+    assert raised.value is expected_error
+
+
+@pytest.mark.asyncio
+async def test_cancelled_blocking_call_waits_for_worker_to_finish() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def block() -> None:
+        started.set()
+        release.wait()
+        finished.set()
+
+    task = asyncio.create_task(youtube_module._run_blocking_call(block))
+    assert await asyncio.to_thread(started.wait, 1)
+
+    task.cancel()
+    await asyncio.sleep(0)
+
+    try:
+        assert not task.done()
+        assert not finished.is_set()
+    finally:
+        release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 1)
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_worker_error_does_not_replace_pending_cancellation() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def fail_after_release() -> None:
+        started.set()
+        release.wait()
+        raise RuntimeError("late yt-dlp failure")
+
+    task = asyncio.create_task(youtube_module._run_blocking_call(fail_after_release))
+    assert await asyncio.to_thread(started.wait, 1)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    try:
+        assert not task.done()
+    finally:
+        release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 1)
 
 
 @pytest.mark.asyncio
@@ -86,9 +165,10 @@ async def test_discovers_authenticated_subscriptions_with_cookie_file(
         "channel-two",
     ]
     assert len(FakeYoutubeDL.calls) == 1
-    options, url, download = FakeYoutubeDL.calls[0]
+    options, url, download, process = FakeYoutubeDL.calls[0]
     assert url == "https://www.youtube.com/feed/channels"
     assert download is False
+    assert process is True
     assert options["cookiefile"] == str(cookie_file)
     assert options["extract_flat"] == "in_playlist"
 
@@ -202,9 +282,10 @@ async def test_inspection_normalizes_reference_before_extracting(tmp_path: Path)
 
     await YoutubeClient(_settings(tmp_path / "cookies")).inspect_channel("@channel-one")
 
-    _, url, download = FakeYoutubeDL.calls[0]
+    _, url, download, process = FakeYoutubeDL.calls[0]
     assert url == "https://www.youtube.com/@channel-one"
     assert download is False
+    assert process is True
 
 
 @pytest.mark.asyncio
@@ -271,21 +352,181 @@ async def test_unlimited_channel_discovery_deduplicates_video_references(
 ) -> None:
     FakeYoutubeDL.payload = {
         "entries": [
-            {"id": "video-one", "url": "https://www.youtube.com/watch?v=video-one"},
-            {"id": "video-one", "url": "https://www.youtube.com/watch?v=video-one"},
+            {
+                "id": "video-one",
+                "url": "https://www.youtube.com/watch?v=video-one",
+                "title": "Video One",
+            },
+            {
+                "id": "video-one",
+                "url": "https://www.youtube.com/watch?v=video-one",
+                "title": "Ignored Duplicate",
+            },
             {"id": "video-two", "url": "video-two"},
         ]
     }
 
-    references = await YoutubeClient(_settings(tmp_path / "cookies")).discover_channel_videos(
-        "https://www.youtube.com/@channel",
+    result = await YoutubeClient(_settings(tmp_path / "cookies")).discover_channel_videos(
+        CHANNEL_ID,
         None,
+        known_video_ids=set(),
+        stop_at_known=False,
     )
 
-    assert [(reference.youtube_video_id, reference.video_url) for reference in references] == [
+    assert [
+        (reference.youtube_video_id, reference.video_url)
+        for reference in result.references
+    ] == [
         ("video-one", "https://www.youtube.com/watch?v=video-one"),
         ("video-two", "https://www.youtube.com/watch?v=video-two"),
     ]
-    options, _, _ = FakeYoutubeDL.calls[0]
+    assert [reference.title for reference in result.references] == ["Video One", None]
+    assert result.source_exhausted is True
+    assert result.stopped_at_known is False
+    options, url, download, process = FakeYoutubeDL.calls[0]
+    assert url == f"https://www.youtube.com/playlist?list=UU{CHANNEL_ID[2:]}"
+    assert download is False
+    assert process is False
     assert "playlistend" not in options
     assert options["extract_flat"] == "in_playlist"
+
+
+@pytest.mark.asyncio
+async def test_incremental_discovery_ignores_limit_until_known_boundary(
+    tmp_path: Path,
+) -> None:
+    consumed: list[str] = []
+
+    def lazy_entries() -> Any:
+        for video_id in ("new-one", "new-two", "known", "must-not-be-consumed"):
+            assert FakeYoutubeDL.active
+            consumed.append(video_id)
+            if video_id == "must-not-be-consumed":
+                raise AssertionError("discovery consumed entries after the known boundary")
+            yield {"id": video_id, "url": video_id, "title": video_id.title()}
+
+    FakeYoutubeDL.payload = {"entries": lazy_entries()}
+
+    result = await YoutubeClient(_settings(tmp_path / "cookies")).discover_channel_videos(
+        CHANNEL_ID,
+        1,
+        known_video_ids={"known"},
+        stop_at_known=True,
+    )
+
+    assert [reference.youtube_video_id for reference in result.references] == [
+        "new-one",
+        "new-two",
+    ]
+    assert consumed == ["new-one", "new-two", "known"]
+    assert result.source_exhausted is False
+    assert result.stopped_at_known is True
+    assert FakeYoutubeDL.active is False
+
+
+@pytest.mark.asyncio
+async def test_backfill_limit_counts_only_unknown_videos(tmp_path: Path) -> None:
+    consumed: list[str] = []
+
+    def lazy_entries() -> Any:
+        for video_id in ("known-one", "new-one", "known-two", "new-two", "later"):
+            assert FakeYoutubeDL.active
+            consumed.append(video_id)
+            yield {"id": video_id, "url": video_id}
+
+    FakeYoutubeDL.payload = {"entries": lazy_entries()}
+
+    result = await YoutubeClient(_settings(tmp_path / "cookies")).discover_channel_videos(
+        CHANNEL_ID,
+        2,
+        known_video_ids={"known-one", "known-two"},
+        stop_at_known=False,
+    )
+
+    assert [reference.youtube_video_id for reference in result.references] == [
+        "new-one",
+        "new-two",
+    ]
+    assert consumed == ["known-one", "new-one", "known-two", "new-two", "later"]
+    assert result.source_exhausted is False
+    assert result.stopped_at_known is False
+
+
+@pytest.mark.asyncio
+async def test_backfill_exact_limit_at_source_end_is_exhausted(tmp_path: Path) -> None:
+    consumed: list[str] = []
+
+    def lazy_entries() -> Any:
+        for video_id in ("known-one", "new-one", "known-two", "new-two"):
+            assert FakeYoutubeDL.active
+            consumed.append(video_id)
+            yield {"id": video_id, "url": video_id}
+
+    FakeYoutubeDL.payload = {"entries": lazy_entries()}
+
+    result = await YoutubeClient(_settings(tmp_path / "cookies")).discover_channel_videos(
+        CHANNEL_ID,
+        2,
+        known_video_ids={"known-one", "known-two"},
+        stop_at_known=False,
+    )
+
+    assert [reference.youtube_video_id for reference in result.references] == [
+        "new-one",
+        "new-two",
+    ]
+    assert consumed == ["known-one", "new-one", "known-two", "new-two"]
+    assert result.source_exhausted is True
+    assert result.stopped_at_known is False
+
+
+@pytest.mark.asyncio
+async def test_channel_discovery_validates_identifier_and_playlist_shape(
+    tmp_path: Path,
+) -> None:
+    client = YoutubeClient(_settings(tmp_path / "cookies"))
+
+    with pytest.raises(YoutubeMetadataError, match="channel identifier"):
+        await client.discover_channel_videos(
+            "not-a-ucid",
+            None,
+            known_video_ids=set(),
+            stop_at_known=False,
+        )
+
+    FakeYoutubeDL.payload = {"entries": {"not": "an iterable video list"}}
+    with pytest.raises(YoutubeMetadataError, match="uploads playlist"):
+        await client.discover_channel_videos(
+            CHANNEL_ID,
+            None,
+            known_video_ids=set(),
+            stop_at_known=False,
+        )
+
+
+def test_yt_dlp_progress_messages_are_debug_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("DEBUG", logger=youtube_module.__name__)
+    logger = youtube_module._YtDlpLogger()
+
+    logger.debug("video: Downloading webpage")
+    logger.info("video: Downloading player API JSON")
+    logger.warning("warning message")
+    logger.error("error message")
+
+    levels = {record.message: record.levelname for record in caplog.records}
+    assert levels == {
+        "video: Downloading webpage": "DEBUG",
+        "video: Downloading player API JSON": "DEBUG",
+        "warning message": "WARNING",
+        "error message": "ERROR",
+    }
+
+    caplog.clear()
+    caplog.set_level("INFO", logger=youtube_module.__name__)
+    logger.debug("video: Downloading webpage")
+    logger.info("video: Downloading player API JSON")
+    logger.warning("visible warning")
+
+    assert [record.message for record in caplog.records] == ["visible warning"]

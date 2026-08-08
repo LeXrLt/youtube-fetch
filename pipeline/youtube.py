@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
@@ -17,6 +17,7 @@ from models import (
     DownloadedSubtitle,
     FetchedVideo,
     SubtitleCandidate,
+    VideoDiscoveryResult,
     VideoMetadata,
     VideoReference,
 )
@@ -27,6 +28,31 @@ from subtitles import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+async def _run_blocking_call[**P, T](
+    function: Callable[P, T],
+    /,
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> T:
+    """Run blocking work without releasing its caller's resources prematurely."""
+
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Keep caller-held locks valid even if cancellation is requested repeatedly.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if task.done() and not task.cancelled():
+            task.exception()
+        raise
 
 
 class YoutubeMetadataError(ValueError):
@@ -133,11 +159,10 @@ def _channel_name(value: str) -> str:
 
 class _YtDlpLogger:
     def debug(self, message: str) -> None:
-        if not message.startswith("[debug] "):
-            LOGGER.info(message)
+        LOGGER.debug(message)
 
     def info(self, message: str) -> None:
-        LOGGER.info(message)
+        LOGGER.debug(message)
 
     def warning(self, message: str) -> None:
         LOGGER.warning(message)
@@ -157,24 +182,40 @@ class YoutubeClient:
         )
 
     async def fetch_video(self, video_url: str) -> FetchedVideo:
-        return await asyncio.to_thread(self._fetch_video_sync, video_url)
+        return await _run_blocking_call(self._fetch_video_sync, video_url)
 
     async def discover_channel_videos(
         self,
-        channel_url: str,
+        youtube_channel_id: str,
         limit: int | None,
-    ) -> list[VideoReference]:
+        *,
+        known_video_ids: Collection[str],
+        stop_at_known: bool,
+    ) -> VideoDiscoveryResult:
         if limit is not None and limit < 1:
             raise ValueError("limit must be at least 1")
-        normalized_url = normalize_channel_reference(channel_url)
-        return await asyncio.to_thread(self._discover_channel_videos_sync, normalized_url, limit)
+        if not _YOUTUBE_CHANNEL_ID.fullmatch(youtube_channel_id):
+            raise YoutubeMetadataError("Invalid YouTube channel identifier")
+        if any(
+            not isinstance(video_id, str) or not video_id
+            for video_id in known_video_ids
+        ):
+            raise ValueError("known_video_ids must contain non-empty strings")
+        normalized_known_video_ids = frozenset(known_video_ids)
+        return await _run_blocking_call(
+            self._discover_channel_videos_sync,
+            youtube_channel_id,
+            limit,
+            normalized_known_video_ids,
+            stop_at_known,
+        )
 
     async def discover_subscribed_channels(self) -> list[ChannelMetadata]:
-        return await asyncio.to_thread(self._discover_subscribed_channels_sync)
+        return await _run_blocking_call(self._discover_subscribed_channels_sync)
 
     async def inspect_channel(self, channel_url: str) -> ChannelMetadata:
         normalized_url = normalize_channel_reference(channel_url)
-        channel = await asyncio.to_thread(self._inspect_channel_sync, normalized_url)
+        channel = await _run_blocking_call(self._inspect_channel_sync, normalized_url)
         if not _YOUTUBE_CHANNEL_ID.fullmatch(channel.youtube_channel_id):
             raise YoutubeMetadataError("YouTube returned an invalid channel identifier")
         return channel
@@ -222,39 +263,86 @@ class YoutubeClient:
 
     def _discover_channel_videos_sync(
         self,
-        channel_url: str,
+        youtube_channel_id: str,
         limit: int | None,
-    ) -> list[VideoReference]:
+        known_video_ids: frozenset[str],
+        stop_at_known: bool,
+    ) -> VideoDiscoveryResult:
         options = {
             **self._base_options(),
             "extract_flat": "in_playlist",
         }
-        if limit is not None:
-            options["playlistend"] = limit
+        uploads_playlist_url = (
+            "https://www.youtube.com/playlist?list="
+            f"UU{youtube_channel_id[2:]}"
+        )
         with YoutubeDL(options) as ydl:
-            info = ydl.extract_info(channel_url, download=False)
-        if not isinstance(info, Mapping):
-            raise YoutubeMetadataError("yt-dlp returned invalid channel metadata")
-        entries = info.get("entries")
-        if not isinstance(entries, Iterable) or isinstance(entries, str | bytes | Mapping):
-            raise YoutubeMetadataError("The URL did not resolve to a channel video list")
-
-        references: list[VideoReference] = []
-        seen_ids: set[str] = set()
-        for entry in entries:
-            if not isinstance(entry, Mapping):
-                continue
-            webpage_url = entry.get("url") or entry.get("webpage_url")
-            video_id = entry.get("id")
-            if not isinstance(video_id, str) or not video_id or video_id in seen_ids:
-                continue
-            if not isinstance(webpage_url, str) or not webpage_url.startswith(
-                ("http://", "https://")
+            info = ydl.extract_info(
+                uploads_playlist_url,
+                download=False,
+                process=False,
+            )
+            if not isinstance(info, Mapping):
+                raise YoutubeMetadataError("yt-dlp returned invalid channel metadata")
+            entries = info.get("entries")
+            if not isinstance(entries, Iterable) or isinstance(
+                entries, str | bytes | Mapping
             ):
-                webpage_url = f"https://www.youtube.com/watch?v={video_id}"
-            references.append(VideoReference(youtube_video_id=video_id, video_url=webpage_url))
-            seen_ids.add(video_id)
-        return references
+                raise YoutubeMetadataError(
+                    "The channel uploads playlist did not contain a video list"
+                )
+
+            references: list[VideoReference] = []
+            seen_ids: set[str] = set()
+            source_exhausted = True
+            stopped_at_known = False
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                webpage_url = entry.get("url") or entry.get("webpage_url")
+                video_id = entry.get("id")
+                if (
+                    not isinstance(video_id, str)
+                    or not video_id
+                    or video_id in seen_ids
+                ):
+                    continue
+                seen_ids.add(video_id)
+                if video_id in known_video_ids:
+                    if stop_at_known:
+                        source_exhausted = False
+                        stopped_at_known = True
+                        break
+                    continue
+                # Peek past a full batch so an exact final batch is marked exhausted.
+                if (
+                    not stop_at_known
+                    and limit is not None
+                    and len(references) >= limit
+                ):
+                    source_exhausted = False
+                    break
+                if not isinstance(webpage_url, str) or not webpage_url.startswith(
+                    ("http://", "https://")
+                ):
+                    webpage_url = f"https://www.youtube.com/watch?v={video_id}"
+                title = entry.get("title")
+                references.append(
+                    VideoReference(
+                        youtube_video_id=video_id,
+                        video_url=webpage_url,
+                        title=(
+                            title
+                            if isinstance(title, str) and title.strip()
+                            else None
+                        ),
+                    )
+                )
+        return VideoDiscoveryResult(
+            references=references,
+            source_exhausted=source_exhausted,
+            stopped_at_known=stopped_at_known,
+        )
 
     def _discover_subscribed_channels_sync(self) -> list[ChannelMetadata]:
         options = {**self._base_options(), "extract_flat": "in_playlist"}

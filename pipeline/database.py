@@ -17,8 +17,11 @@ from models import (
     DownloadedSubtitle,
     FetchedVideo,
     StoredVideo,
+    SubtitleDownloadStatus,
+    SubtitleDownloadTask,
     TranslationResult,
     VideoMetadata,
+    VideoReference,
 )
 
 
@@ -53,7 +56,13 @@ class PipelineRepository:
             self._pool = None
 
     @asynccontextmanager
-    async def process_lock(self) -> AsyncIterator[None]:
+    async def process_lock(
+        self,
+        lock_name: str = "pipeline_process",
+    ) -> AsyncIterator[None]:
+        if not isinstance(lock_name, str) or not lock_name.strip():
+            raise ValueError("lock_name must be a non-empty string")
+
         # A dedicated session keeps the lock independent from pool size and resets.
         connection = await asyncpg.connect(
             host=self._settings.host,
@@ -67,13 +76,14 @@ class PipelineRepository:
             acquired = await connection.fetchval(
                 """
                 SELECT pg_try_advisory_lock(
-                    hashtextextended(current_database() || ':pipeline_process', 0)
+                    hashtextextended(current_database() || ':' || $1::text, 0)
                 )
-                """
+                """,
+                lock_name,
             )
             if acquired is not True:
                 raise PipelineAlreadyRunningError(
-                    "Another resource-intensive Pipeline process is already running"
+                    f"Another Pipeline process is already running for {lock_name!r}"
                 )
             yield
         finally:
@@ -182,6 +192,190 @@ class PipelineRepository:
         )
         return [_channel_record(row) for row in rows]
 
+    async def list_known_video_ids(
+        self,
+        channel_ids: Sequence[UUID],
+    ) -> dict[UUID, set[str]]:
+        if not channel_ids:
+            return {}
+        if any(not isinstance(channel_id, UUID) for channel_id in channel_ids):
+            raise TypeError("channel_ids must contain only UUID values")
+
+        normalized_channel_ids = list(dict.fromkeys(channel_ids))
+        rows = await self._require_pool().fetch(
+            """
+            SELECT channel_id, youtube_video_id
+            FROM videos
+            WHERE channel_id = ANY($1::uuid[])
+            """,
+            normalized_channel_ids,
+        )
+        known_video_ids = {
+            channel_id: set() for channel_id in normalized_channel_ids
+        }
+        for row in rows:
+            known_video_ids[row["channel_id"]].add(row["youtube_video_id"])
+        return known_video_ids
+
+    async def enqueue_subtitle_downloads(
+        self,
+        channel_id: UUID,
+        references: Sequence[VideoReference],
+    ) -> dict[str, SubtitleDownloadStatus]:
+        if not isinstance(channel_id, UUID):
+            raise TypeError("channel_id must be a UUID")
+        if not references:
+            return {}
+
+        unique_references: dict[str, tuple[str, str]] = {}
+        for reference in references:
+            youtube_video_id = reference.youtube_video_id.strip()
+            video_url = reference.video_url.strip()
+            if not youtube_video_id:
+                raise ValueError("youtube_video_id must be a non-empty string")
+            if not video_url:
+                raise ValueError("video_url must be a non-empty string")
+            title = (reference.title or "").strip() or youtube_video_id
+            unique_references[youtube_video_id] = (video_url, title)
+
+        youtube_video_ids = list(unique_references)
+        video_urls = [unique_references[video_id][0] for video_id in youtube_video_ids]
+        titles = [unique_references[video_id][1] for video_id in youtube_video_ids]
+        rows = await self._require_pool().fetch(
+            """
+            INSERT INTO videos(
+                channel_id,
+                youtube_video_id,
+                title,
+                video_url,
+                subtitle_download_status,
+                subtitle_download_error
+            )
+            SELECT $1, input.youtube_video_id, input.title, input.video_url, 0, NULL
+            FROM unnest($2::text[], $3::text[], $4::text[])
+                AS input(youtube_video_id, video_url, title)
+            ON CONFLICT (youtube_video_id) DO UPDATE
+            SET channel_id = EXCLUDED.channel_id,
+                title = CASE
+                    WHEN EXCLUDED.title = EXCLUDED.youtube_video_id
+                    THEN videos.title
+                    ELSE EXCLUDED.title
+                END,
+                video_url = EXCLUDED.video_url,
+                updated_at = now()
+            RETURNING youtube_video_id, subtitle_download_status
+            """,
+            channel_id,
+            youtube_video_ids,
+            video_urls,
+            titles,
+        )
+        return {
+            row["youtube_video_id"]: SubtitleDownloadStatus(
+                row["subtitle_download_status"]
+            )
+            for row in rows
+        }
+
+    async def list_subtitle_download_candidates(
+        self,
+        channel_ids: Sequence[UUID],
+        force_video_ids: Sequence[str],
+    ) -> list[SubtitleDownloadTask]:
+        if not channel_ids:
+            return []
+        if any(not isinstance(channel_id, UUID) for channel_id in channel_ids):
+            raise TypeError("channel_ids must contain only UUID values")
+        normalized_force_ids: list[str] = []
+        seen_force_ids: set[str] = set()
+        for video_id in force_video_ids:
+            normalized_video_id = video_id.strip()
+            if not normalized_video_id:
+                raise ValueError("force_video_ids must contain non-empty strings")
+            if normalized_video_id not in seen_force_ids:
+                normalized_force_ids.append(normalized_video_id)
+                seen_force_ids.add(normalized_video_id)
+
+        normalized_channel_ids = list(dict.fromkeys(channel_ids))
+        pool = self._require_pool()
+        async with pool.acquire() as connection, connection.transaction():
+            await connection.execute(
+                """
+                UPDATE videos AS video
+                SET subtitle_status = 'pending',
+                    subtitle_checked_at = NULL,
+                    subtitle_download_status = 0,
+                    updated_at = now()
+                WHERE video.channel_id = ANY($1::uuid[])
+                  AND video.subtitle_download_status = 1
+                  AND video.subtitle_status IN ('fetched', 'invalid')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM subtitle_tracks AS subtitle
+                      WHERE subtitle.video_id = video.id
+                  )
+                """,
+                normalized_channel_ids,
+            )
+            rows = await connection.fetch(
+                """
+                SELECT channel_id, youtube_video_id, video_url, title,
+                       subtitle_download_status
+                FROM videos
+                WHERE channel_id = ANY($1::uuid[])
+                  AND (
+                      subtitle_download_status IN (0, 2)
+                      OR (
+                          subtitle_download_status = 1
+                          AND youtube_video_id = ANY($2::text[])
+                      )
+                  )
+                ORDER BY subtitle_download_status ASC,
+                         subtitle_checked_at ASC NULLS FIRST,
+                         created_at ASC,
+                         id ASC
+                """,
+                normalized_channel_ids,
+                normalized_force_ids,
+            )
+        return [
+            SubtitleDownloadTask(
+                channel_id=row["channel_id"],
+                youtube_video_id=row["youtube_video_id"],
+                video_url=row["video_url"],
+                title=(row["title"] or "").strip() or row["youtube_video_id"],
+                status=SubtitleDownloadStatus(row["subtitle_download_status"]),
+            )
+            for row in rows
+        ]
+
+    async def mark_subtitle_download_failed(
+        self,
+        youtube_video_id: str,
+        error_message: str,
+    ) -> None:
+        youtube_video_id = youtube_video_id.strip()
+        error_message = error_message.strip()
+        if not youtube_video_id:
+            raise ValueError("youtube_video_id must be a non-empty string")
+        if not error_message:
+            raise ValueError("error_message must be a non-empty string")
+        updated_video_id = await self._require_pool().fetchval(
+            """
+            UPDATE videos
+            SET subtitle_download_status = 2,
+                subtitle_download_error = $2,
+                subtitle_checked_at = now(),
+                updated_at = now()
+            WHERE youtube_video_id = $1
+            RETURNING id
+            """,
+            youtube_video_id,
+            error_message[:8000],
+        )
+        if updated_video_id is None:
+            raise LookupError(f"Unknown YouTube video ID: {youtube_video_id}")
+
     async def get_stored_video(self, youtube_video_id: str) -> StoredVideo | None:
         row = await self._require_pool().fetchrow(
             """
@@ -194,6 +388,7 @@ class PipelineRepository:
                 video.duration_seconds,
                 video.published_at,
                 video.subtitle_status,
+                video.subtitle_download_status,
                 channel.youtube_channel_id,
                 channel.handle,
                 channel.title AS channel_title,
@@ -249,13 +444,18 @@ class PipelineRepository:
             published_at=row["published_at"],
         )
         subtitle_status = row["subtitle_status"]
+        subtitle_download_status = SubtitleDownloadStatus(
+            row["subtitle_download_status"]
+        )
         if row["subtitle_track_id"] is None and subtitle_status in {"fetched", "invalid"}:
             subtitle_status = "pending"
+            subtitle_download_status = SubtitleDownloadStatus.PENDING
         return StoredVideo(
             video_id=row["video_id"],
             subtitle_track_id=row["subtitle_track_id"],
             fetched=FetchedVideo(metadata=metadata, subtitle=subtitle),
             subtitle_status=subtitle_status,
+            subtitle_download_status=subtitle_download_status,
             translated_text=row["translated_text"],
             translated_language_code=row["translated_language_code"],
             translation_metadata=_json_object(row["translation_metadata"]),
@@ -293,13 +493,17 @@ class PipelineRepository:
                     published_at,
                     downloaded_at,
                     subtitle_status,
-                    subtitle_checked_at
+                    subtitle_checked_at,
+                    subtitle_download_status,
+                    subtitle_download_error
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7,
                     CASE WHEN $8 IN ('fetched', 'invalid') THEN now() ELSE NULL END,
                     $8,
-                    now()
+                    now(),
+                    1,
+                    NULL
                 )
                 ON CONFLICT (youtube_video_id) DO UPDATE
                 SET channel_id = EXCLUDED.channel_id,
@@ -316,6 +520,8 @@ class PipelineRepository:
                         ELSE EXCLUDED.subtitle_status
                     END,
                     subtitle_checked_at = EXCLUDED.subtitle_checked_at,
+                    subtitle_download_status = 1,
+                    subtitle_download_error = NULL,
                     updated_at = now()
                 RETURNING id
                 """,
@@ -366,6 +572,74 @@ class PipelineRepository:
                 subtitle.normalized_text,
             )
             return video_id, subtitle_id
+
+    async def list_analysis_candidates(
+        self,
+        *,
+        profile_name: str,
+        schema_version: str,
+        prompt_version: str,
+        prompt_sha256: str,
+        translation_schema_sha256: str,
+        schema_sha256: str,
+        force: bool,
+        limit: int | None,
+    ) -> list[VideoReference]:
+        rows = await self._require_pool().fetch(
+            """
+            SELECT video.youtube_video_id, video.video_url
+            FROM videos AS video
+            JOIN LATERAL (
+                SELECT subtitle.id, subtitle.normalized_text
+                FROM subtitle_tracks AS subtitle
+                WHERE subtitle.video_id = video.id
+                ORDER BY subtitle.fetched_at DESC,
+                         subtitle.created_at DESC,
+                         subtitle.id DESC
+                LIMIT 1
+            ) AS latest_subtitle ON true
+            WHERE latest_subtitle.normalized_text IS NOT NULL
+              AND (
+                  $7::boolean
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM video_analyses AS analysis
+                      JOIN analysis_runs AS run
+                        ON run.id = analysis.analysis_run_id
+                      WHERE analysis.video_id = video.id
+                        AND analysis.subtitle_track_id = latest_subtitle.id
+                        AND analysis.profile_name = $1
+                        AND analysis.output_schema_version = $2
+                        AND run.status = 'succeeded'
+                        AND run.prompt_version = $3
+                        AND run.metadata ->> 'prompt_sha256' = $4
+                        AND run.metadata ->> 'translation_schema_sha256' = $5
+                        AND run.metadata ->> 'schema_sha256' = $6
+                        AND run.metadata ->> 'source_sha256' = encode(
+                            digest(latest_subtitle.normalized_text, 'sha256'),
+                            'hex'
+                        )
+                  )
+              )
+            ORDER BY video.created_at ASC, video.id ASC
+            LIMIT $8::integer
+            """,
+            profile_name,
+            schema_version,
+            prompt_version,
+            prompt_sha256,
+            translation_schema_sha256,
+            schema_sha256,
+            force,
+            limit,
+        )
+        return [
+            VideoReference(
+                youtube_video_id=row["youtube_video_id"],
+                video_url=row["video_url"],
+            )
+            for row in rows
+        ]
 
     async def has_matching_analysis(
         self,

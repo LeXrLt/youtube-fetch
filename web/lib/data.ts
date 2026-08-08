@@ -3,12 +3,14 @@ import "server-only";
 import { connection } from "next/server";
 import type { Pool, QueryResultRow } from "pg";
 
+import { analysisKeyPoints, analysisSources } from "./analysis-values";
 import { getReadOnlyPool } from "./pool";
 import { PAGE_SIZE, isUuid, parseFeedQuery } from "./query-params";
 import {
   buildChannelSummaryQuery,
   buildFeedQueries,
   buildManagedChannelsQuery,
+  buildPostDetailQuery,
   buildSidebarChannelsQuery,
   buildTagFeedQueries,
   buildTagSummaryQuery,
@@ -26,6 +28,8 @@ import type {
   FeedTag,
   ManagedChannel,
   PaginatedResult,
+  PostAnalysis,
+  PostDetail,
   SidebarData,
   TagDetail,
   TagSummary,
@@ -98,6 +102,22 @@ interface ChannelSummaryRow extends QueryResultRow {
 interface ManagedChannelRow extends ChannelSummaryRow {
   youtube_channel_id: string;
   is_active: boolean;
+}
+
+interface PostDetailRow extends FeedRow {
+  translated_transcript: string | null;
+  translated_language_code: string | null;
+  analysis_id: string | null;
+  analysis_is_relevant: boolean | null;
+  relevance_score: string | number | null;
+  quality_score: string | number | null;
+  summary: string | null;
+  translated_summary: string | null;
+  background_notes: string | null;
+  analysis_key_points: unknown;
+  filter_reason: string | null;
+  analysis_sources: unknown;
+  analyzed_at: Date | string | null;
 }
 
 function numericCount(value: string | number): number {
@@ -204,6 +224,49 @@ function managedChannel(row: ManagedChannelRow): ManagedChannel {
   };
 }
 
+function optionalScore(value: string | number | null, name: string): number | null {
+  if (value === null) {
+    return null;
+  }
+
+  const score = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(score) || score < 0 || score > 100) {
+    throw new Error(`Database returned an invalid ${name}`);
+  }
+  return score;
+}
+
+function postDetail(row: PostDetailRow): PostDetail {
+  if ((row.translated_transcript === null) !== (row.translated_language_code === null)) {
+    throw new Error("Database returned an incomplete subtitle translation");
+  }
+
+  let analysis: PostAnalysis | null = null;
+  if (row.analysis_id !== null) {
+    if (typeof row.analysis_is_relevant !== "boolean" || row.analyzed_at === null) {
+      throw new Error("Database returned an incomplete post analysis");
+    }
+    analysis = {
+      isRelevant: row.analysis_is_relevant,
+      relevanceScore: optionalScore(row.relevance_score, "relevance score"),
+      qualityScore: optionalScore(row.quality_score, "quality score"),
+      summary: row.translated_summary ?? row.summary,
+      backgroundNotes: row.background_notes,
+      keyPoints: analysisKeyPoints(row.analysis_key_points),
+      filterReason: row.filter_reason,
+      sources: analysisSources(row.analysis_sources),
+      analyzedAt: isoDate(row.analyzed_at) as string,
+    };
+  }
+
+  return {
+    post: feedPost(row),
+    translatedTranscript: row.translated_transcript,
+    translatedLanguageCode: row.translated_language_code,
+    analysis,
+  };
+}
+
 async function runtimePool(): Promise<Pool> {
   await connection();
   return getReadOnlyPool();
@@ -252,6 +315,16 @@ export async function getOriginalFeed(
   input: FeedQueryInput = {},
 ): Promise<PaginatedResult<FeedPost>> {
   return getFeed("original", input);
+}
+
+export async function getPostDetail(postId: string): Promise<PostDetail | null> {
+  if (!isUuid(postId)) {
+    return null;
+  }
+
+  const pool = await runtimePool();
+  const rows = await query<PostDetailRow>(pool, buildPostDetailQuery(postId));
+  return rows[0] ? postDetail(rows[0]) : null;
 }
 
 export async function getTags(): Promise<TagSummary[]> {

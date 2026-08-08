@@ -202,6 +202,85 @@ OFFSET ${offsetPlaceholder}`,
   };
 }
 
+export function buildPostDetailQuery(postId: string): SqlQuery {
+  return {
+    text: `SELECT
+  video.id AS video_id,
+  subtitle.id AS subtitle_id,
+  video.youtube_video_id,
+  video.title AS video_title,
+  video.video_url,
+  video.description AS video_description,
+  video.duration_seconds,
+  video.published_at,
+  COALESCE(subtitle.normalized_text, subtitle.raw_text) AS transcript,
+  subtitle.language_code,
+  subtitle.language_name,
+  subtitle.is_auto_generated,
+  channel.id AS channel_id,
+  channel.title AS channel_title,
+  channel.handle AS channel_handle,
+  channel.channel_url,
+  channel.description AS channel_description,
+  channel.avatar_url AS channel_avatar_url,
+  COALESCE(post_tags.tags, '[]'::jsonb) AS tags,
+  subtitle.translated_text AS translated_transcript,
+  subtitle.translated_language_code,
+  latest_analysis.id AS analysis_id,
+  latest_analysis.is_relevant AS analysis_is_relevant,
+  latest_analysis.relevance_score,
+  latest_analysis.quality_score,
+  latest_analysis.summary,
+  latest_analysis.translated_summary,
+  latest_analysis.background_notes,
+  COALESCE(latest_analysis.key_points, '[]'::jsonb) AS analysis_key_points,
+  CASE
+    WHEN latest_analysis.profile_name = 'default'
+     AND latest_analysis.output_schema_version = '1'
+    THEN latest_analysis.raw_agent_output ->> 'filter_reason'
+  END AS filter_reason,
+  CASE
+    WHEN latest_analysis.profile_name = 'default'
+     AND latest_analysis.output_schema_version = '1'
+    THEN latest_analysis.raw_agent_output -> 'sources'
+  END AS analysis_sources,
+  latest_analysis.analyzed_at
+FROM subtitle_tracks AS subtitle
+INNER JOIN videos AS video ON video.id = subtitle.video_id
+INNER JOIN youtube_channels AS channel ON channel.id = video.channel_id
+LEFT JOIN LATERAL (
+  SELECT
+    analysis.id,
+    analysis.is_relevant,
+    analysis.relevance_score,
+    analysis.quality_score,
+    analysis.summary,
+    analysis.translated_summary,
+    analysis.background_notes,
+    analysis.key_points,
+    analysis.raw_agent_output,
+    analysis.profile_name,
+    analysis.output_schema_version,
+    analysis.analyzed_at
+  FROM video_analyses AS analysis
+  INNER JOIN analysis_runs AS analysis_run
+    ON analysis_run.id = analysis.analysis_run_id
+   AND analysis_run.status = 'succeeded'
+  WHERE analysis.video_id = video.id
+    AND analysis.subtitle_track_id = subtitle.id
+  ORDER BY
+    analysis.analyzed_at DESC,
+    analysis.created_at DESC,
+    analysis.id DESC
+  LIMIT 1
+) AS latest_analysis ON true
+${POST_TAGS_LATERAL}
+WHERE subtitle.id = $1::uuid
+LIMIT 1`,
+    values: [postId],
+  };
+}
+
 export function buildTagFeedQueries(
   tagId: string,
   query: ParsedFeedQuery,

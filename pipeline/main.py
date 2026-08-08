@@ -5,7 +5,6 @@ import asyncio
 import json
 import logging
 import os
-from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
@@ -19,7 +18,32 @@ from service import PipelineService
 from youtube import YoutubeClient, YoutubeMetadataError
 
 LOGGER = logging.getLogger(__name__)
-PROCESS_LOCK_COMMANDS = frozenset({"run", "video"})
+
+
+def _non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return parsed
+
+
+def _add_channel_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    force_help: str,
+) -> None:
+    parser.add_argument(
+        "--channel",
+        action="append",
+        default=[],
+        metavar="URL",
+        help="YouTube channel URL; may be repeated",
+    )
+    parser.add_argument("--max-videos-per-channel", type=_non_negative_int)
+    parser.add_argument("--force", action="store_true", help=force_help)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -57,19 +81,29 @@ def _parser() -> argparse.ArgumentParser:
     video.add_argument("video_url")
     video.add_argument("--force", action="store_true", help="Create a new analysis revision")
 
+    download = subparsers.add_parser(
+        "download",
+        help="Fetch subtitles for specified channels or active database channels",
+    )
+    _add_channel_arguments(download, force_help="Refetch video metadata and subtitles")
+
+    analyze = subparsers.add_parser(
+        "analyze",
+        help="Analyze subtitles already stored in the database",
+    )
+    analyze.add_argument(
+        "--limit",
+        type=_non_negative_int,
+        default=0,
+        help="Maximum videos to analyze; 0 means unlimited",
+    )
+    analyze.add_argument("--force", action="store_true", help="Create new analysis revisions")
+
     run = subparsers.add_parser(
         "run",
         help="Process specified channels or active database channels",
     )
-    run.add_argument(
-        "--channel",
-        action="append",
-        default=[],
-        metavar="URL",
-        help="YouTube channel URL; may be repeated",
-    )
-    run.add_argument("--max-videos-per-channel", type=int)
-    run.add_argument("--force", action="store_true", help="Create new analysis revisions")
+    _add_channel_arguments(run, force_help="Refetch subtitles and create new analyses")
     return parser
 
 
@@ -92,6 +126,24 @@ def _service(settings: RuntimeSettings, repository: PipelineRepository) -> Pipel
         YoutubeClient(settings.youtube),
         AnalysisEngine(settings, agent),
     )
+
+
+def _max_videos_per_channel(
+    args: argparse.Namespace,
+    settings: RuntimeSettings,
+) -> int | None:
+    value = (
+        args.max_videos_per_channel
+        if args.max_videos_per_channel is not None
+        else settings.youtube.max_videos_per_channel
+    )
+    if value < 0:
+        raise ValueError("max-videos-per-channel must not be negative")
+    return value or None
+
+
+def _results_exit_code(results: list[object]) -> int:
+    return 1 if any(getattr(result, "status", None) == "failed" for result in results) else 0
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -124,40 +176,68 @@ async def _run(args: argparse.Namespace) -> int:
         return 0
 
     repository = PipelineRepository(settings.database)
-    lock_context = (
-        repository.process_lock()
-        if args.command in PROCESS_LOCK_COMMANDS
-        else nullcontext()
-    )
-    async with lock_context:
-        try:
-            await repository.connect()
-            service = _service(settings, repository)
-            if args.command == "channel-add":
-                channel_id = await service.add_channel(args.channel_url, args.researcher)
-                print(json.dumps({"channel_id": str(channel_id)}, ensure_ascii=False))
-                return 0
-            if args.command == "video":
-                result = await service.process_video(args.video_url, force=args.force)
-                print(json.dumps(asdict(result), ensure_ascii=False))
-                return 0
-            if args.command == "run":
-                max_videos = (
-                    args.max_videos_per_channel
-                    if args.max_videos_per_channel is not None
-                    else settings.youtube.max_videos_per_channel
-                )
-                if max_videos < 0:
-                    raise ValueError("max-videos-per-channel must not be negative")
-                results = await service.run_channels(
+    try:
+        await repository.connect()
+        service = _service(settings, repository)
+        if args.command == "channel-add":
+            channel_id = await service.add_channel(args.channel_url, args.researcher)
+            print(json.dumps({"channel_id": str(channel_id)}, ensure_ascii=False))
+            return 0
+        if args.command == "download":
+            async with repository.process_lock("download"):
+                results = await service.download_channels(
                     args.channel,
-                    max_videos_per_channel=max_videos or None,
+                    max_videos_per_channel=_max_videos_per_channel(args, settings),
                     force=args.force,
                 )
-                print(json.dumps([asdict(result) for result in results], ensure_ascii=False))
-                return 1 if any(result.status == "failed" for result in results) else 0
-        finally:
-            await repository.close()
+            print(json.dumps([asdict(result) for result in results], ensure_ascii=False))
+            return _results_exit_code(results)
+        if args.command == "analyze":
+            if args.limit < 0:
+                raise ValueError("limit must not be negative")
+            async with repository.process_lock("analysis"):
+                results = await service.analyze_pending(
+                    max_videos=args.limit or None,
+                    force=args.force,
+                )
+            print(json.dumps([asdict(result) for result in results], ensure_ascii=False))
+            return _results_exit_code(results)
+        if args.command == "video":
+            stage_results = []
+            async with repository.process_lock("download"):
+                download_result = await service.download_video(
+                    args.video_url,
+                    force=args.force,
+                )
+            stage_results.append(download_result)
+            result = download_result
+            if download_result.youtube_video_id is not None:
+                async with repository.process_lock("analysis"):
+                    result = await service.analyze_video(
+                        download_result.youtube_video_id,
+                        force=args.force,
+                    )
+                stage_results.append(result)
+            print(json.dumps(asdict(result), ensure_ascii=False))
+            return _results_exit_code(stage_results)
+        if args.command == "run":
+            results = []
+            async with repository.process_lock("download"):
+                results.extend(
+                    await service.download_channels(
+                        args.channel,
+                        max_videos_per_channel=_max_videos_per_channel(args, settings),
+                        force=args.force,
+                    )
+                )
+            async with repository.process_lock("analysis"):
+                results.extend(
+                    await service.analyze_pending(max_videos=None, force=args.force)
+                )
+            print(json.dumps([asdict(result) for result in results], ensure_ascii=False))
+            return _results_exit_code(results)
+    finally:
+        await repository.close()
 
     raise RuntimeError(f"Unsupported command: {args.command}")
 

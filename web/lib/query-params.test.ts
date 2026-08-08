@@ -9,6 +9,7 @@ import {
   paginationOffset,
   parseFeedQuery,
   parsePage,
+  parsePostMode,
   parseQuery,
 } from "./query-params";
 
@@ -50,6 +51,19 @@ describe("parseQuery", () => {
       q: "agent",
       page: 2,
     });
+  });
+});
+
+describe("parsePostMode", () => {
+  it("defaults missing and unsupported values to original", () => {
+    expect(parsePostMode(undefined)).toBe("original");
+    expect(parsePostMode("original")).toBe("original");
+    expect(parsePostMode("invalid")).toBe("original");
+  });
+
+  it("accepts translated mode and selects the first repeated value", () => {
+    expect(parsePostMode("translated")).toBe("translated");
+    expect(parsePostMode(["translated", "original"])).toBe("translated");
   });
 });
 

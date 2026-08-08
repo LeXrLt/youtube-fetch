@@ -44,6 +44,16 @@ WEB_ROUTE_KEY=<生成的 32 位密钥>
 chmod 600 pipeline/config/youtube.cookies.txt
 ```
 
+`pipeline/config/pipeline.toml` 中的下载并发默认为：
+
+```toml
+[pipeline]
+download_concurrency = 4
+```
+
+允许范围为 `1..16`。该上限同时约束频道发现和字幕下载的异步 I/O；应结合网络、数据库连接
+池和主机容量调整。分析保持逐视频运行，不受该配置影响。
+
 ## 安装与构建
 
 在项目根目录执行：
@@ -64,11 +74,26 @@ cd ..
 
 ## 启动
 
-运行一次 Pipeline：
+兼容原有方式运行一次完整 Pipeline；该命令先完成所有下载，再开始分析：
 
 ```bash
 pipeline/.venv/bin/python pipeline/main.py run
 ```
+
+生产环境更适合将两个阶段作为独立调度任务：
+
+```bash
+# 高频发现视频并下载字幕，不调用 Codex
+pipeline/.venv/bin/python pipeline/main.py download
+
+# 消费数据库中的待分析字幕；0 表示不限量
+pipeline/.venv/bin/python pipeline/main.py analyze --limit 20
+```
+
+下载结果在进入分析前已经提交到 PostgreSQL。分析任务失败、取消或暂时未取得锁时，后续
+`analyze` 可直接从数据库继续，不需要重新访问 YouTube。两个命令可以同时运行；分析启动
+时会固定候选视频集合，新加入的视频留给下一轮；候选视频在执行前若被强制刷新，则读取其
+最新字幕。可分别设置不同的触发频率和超时，避免大量 Codex 任务拖延新字幕抓取。
 
 启动 Web 服务：
 
@@ -82,6 +107,30 @@ Web 必须通过 `/<密钥>` 访问，根路径 `/` 返回 404。反向代理必
 不要在文档、日志或公开配置中记录实际密钥。
 
 生产环境中应使用外部调度器周期运行 Pipeline，并使用进程管理器保持 Web 服务常驻。
-`run` 和 `video` 通过 PostgreSQL advisory lock 防止任务重叠；调度器触发重叠任务时，后者
-会立即失败且不会排队。若需要在 Web 中新增频道，必须保留 `pipeline/.venv` 和私有
-YouTube Cookie；仅作只读展示时可跳过 Pipeline 的安装和运行。
+PostgreSQL advisory lock 保证同一数据库最多同时运行一个下载阶段和一个分析阶段；同类
+任务重叠时后触发者立即失败且不会排队，下载与分析则可并行。`run` 和 `video` 也按阶段依次
+获取对应锁，不会同时占用两把锁。`config-check`、`migrate`、`channel-inspect` 和
+`channel-add` 不占用阶段锁。
+
+旧版本只使用单一的 `pipeline_process` 锁，与新版阶段锁互不识别。升级时必须先停止旧版
+`run`/`video` 调度并等待进程完全退出，再启用新版 `download`/`analyze` 调度；不得让两个
+版本滚动混跑。`run` 的频道和每频道数量参数只限制下载阶段，随后仍会分析数据库中的全局
+候选；生产环境需要限制 Codex 工作量时使用独立的 `analyze --limit N`。
+
+升级版本包含 `011_subtitle_download_status.sql`：它增加 `0=待下载`、`1=已下载`、
+`2=下载失败` 的持久化调度状态和错误字段。部署入口必须先运行 `./db/migrate.sh`；Pipeline
+业务命令也会在连接数据库前自动执行迁移。下载失败只影响当前视频，本轮继续处理队列；下一
+次启动时先执行待下载任务，再重试历史失败任务。
+
+频道发现使用 Uploads playlist。新频道会完整回填，或按正数 `max_videos_per_channel` 分批
+回填；完整枚举并成功入队后立即记录 `initial_backfill_completed_at`，不等待字幕成功。此后
+普通调度从最新视频扫描到运行前已知 video ID 即停止，`0`、`1`、`2` 都是边界，状态 `2`
+仍由下载队列在队尾重试。`--force` 保持完整扫描或服从显式数量限制。旧库中已有视频但首次
+回填 marker 为空的频道，升级后会额外完整扫描一次（设置限制时分批扫完）来建立可信边界；
+评估首次部署窗口时应计入这次一次性 YouTube 请求量。
+
+生产日志建议保持默认 `--log-level INFO`：它记录频道发现、字幕任务开始、成功、无字幕、
+无效字幕、失败及重试队列等业务状态，同时隐藏 yt-dlp 的底层网页和播放器请求。排障时临时
+切换为 `--log-level DEBUG` 查看底层请求和异常堆栈；yt-dlp 警告与错误在默认级别仍可见。
+日志不得包含 Cookie 或数据库凭据。若需要在 Web 中新增频道，必须保留
+`pipeline/.venv` 和私有 YouTube Cookie；仅作只读展示时可跳过 Pipeline 的安装和运行。

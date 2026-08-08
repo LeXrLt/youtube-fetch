@@ -53,11 +53,15 @@ PostgreSQL 由本机已有服务提供，本项目不负责安装或部署数据
 - 通过版本化 SQL 维护表、约束和索引。
 - 为 Python 写入端和 Next.js 读取端提供稳定的数据结构。
 
-数据流如下：
+下载与分析以 PostgreSQL 中已提交的视频和字幕为持久边界，数据流如下：
 
 ```text
-YouTube -> yt-dlp -> 字幕清洗 -> Codex Agent -> PostgreSQL -> Next.js App
+YouTube -> yt-dlp -> 字幕清洗 -> PostgreSQL
+PostgreSQL -> Codex Agent -> PostgreSQL -> Next.js App
 ```
+
+下载阶段完成后不等待 Agent 即可释放下载调度资源；分析阶段只读取数据库，不访问 YouTube。
+因此两个阶段可由独立进程并行运行，分析积压不会阻止后续频道继续发现和下载字幕。
 
 ## 3. 环境配置
 
@@ -131,9 +135,9 @@ install、`src/<package>` 布局或项目 wheel。Pipeline 入口为 `pipeline/m
 ### 4.1 新设备部署
 
 `db/migrate.sh` 是部署前置钩子。Pipeline 已实现 `channel-inspect`、`migrate`、
-`channel-add`、`video` 和 `run` 命令；只读的 `config-check`、`channel-inspect` 不执行
-迁移，其余命令会在数据库连接和业务操作前自动执行迁移。独立部署 Next.js App 时仍须
-在启动前显式执行迁移：
+`channel-add`、`download`、`analyze`、`video` 和 `run` 命令；只读的 `config-check`、
+`channel-inspect` 不执行迁移，其余命令会在数据库连接和业务操作前自动执行迁移。独立部署
+Next.js App 时仍须在启动前显式执行迁移：
 
 ```bash
 set -e
@@ -144,10 +148,36 @@ set -e
 新增部署编排、systemd、容器 entrypoint 或 CI/CD workflow 时，必须把该命令接入其
 pre-deploy 阶段，不能依赖开发者手工执行 SQL。
 
-`run` 与 `video` 在业务数据库上持有同一个 PostgreSQL 会话级 advisory lock。锁使用独立
-连接，不占用 asyncpg 业务连接池；竞争任务必须立即失败而不是等待。锁连接关闭时由
-PostgreSQL 自动释放，因此不得将其改为可能遗留陈旧状态的普通标记行或 PID 文件。
-频道管理和只读检查命令不使用该锁，避免长时间抓取阻断 Web 的频道管理流程。
+下载和分析在业务数据库上使用名称不同的 PostgreSQL 会话级 advisory lock。`download`
+持下载锁，`analyze` 持分析锁；`run` 和 `video` 按下载、分析顺序分别持锁，中间先释放下载
+锁。同类任务互斥并在竞争时立即失败，下载与分析任务可同时运行。锁使用独立连接，不占用
+asyncpg 业务连接池；连接关闭时由 PostgreSQL 自动释放，因此不得将其改为可能遗留陈旧
+状态的普通标记行或 PID 文件。频道管理和只读检查命令不使用阶段锁。
+
+`[pipeline].download_concurrency` 对频道发现与视频字幕抓取共享一个异步并发上限，默认
+为 `4`，配置校验范围是 `1..16`。分析保持单视频顺序执行。生产调度应优先分别运行
+`download` 和 `analyze --limit N`；`run` 用于兼容原有一次性流程，但也会先完成所有下载，
+再分析数据库中的全局候选视频集合；`run` 的频道和每频道数量参数只约束下载阶段。
+
+频道发现通过频道 ID 对应的 Uploads playlist 完成。首次回填不限量时完整枚举；设置正数
+`max_videos_per_channel` 时按未发现视频数量分批推进。只有枚举到 playlist 末尾且本次引用
+全部成功幂等入队后，才立即写 `initial_backfill_completed_at`，不等待字幕下载或分析。首次
+回填完成后的普通运行从最新视频向后扫描，遇到运行前已登记的 video ID 即停止；`0`、`1`、
+`2` 三种字幕下载状态都构成已知边界。`--force` 不在已知 ID 处停止，按不限量或显式限制
+重新扫描。旧数据若 marker 为空，会再执行一次完整扫描（也可分批完成）建立可信边界。
+
+Pipeline 先把发现的视频引用幂等登记到 `videos`，再一次性读取所选频道的全局下载候选快照。
+`subtitle_download_status` 是独立的数值调度状态：`0` 表示待下载，`1` 表示
+下载检查完成，`2` 表示下载失败。队列先调度全部 `0`，再按失败检查时间调度历史 `2`；本轮
+新失败只写入状态和错误信息，不重新查询或重新入队，因此会继续处理后续任务并在下次启动时
+排到待下载任务之后重试。`unavailable` 和 `invalid` 仍保留在原有 `subtitle_status` 中，且
+对应数值状态 `1`，避免把“确认无字幕”或“已下载但无法规范化”误当成传输失败反复抓取。
+字幕下载完成即提交到 PostgreSQL，后续分析失败或取消时可独立恢复。
+
+运行日志以业务状态为可观测边界。默认 `INFO` 记录频道发现的模式、数量和停止原因，以及
+字幕任务的开始、成功、无匹配字幕、无法规范化、跳过、失败和 `retry` 队列来源。yt-dlp 的
+网页和播放器请求进度统一降为 `DEBUG`，警告与错误仍保留原级别；异常堆栈也仅在 `DEBUG`
+展开，避免默认日志被底层请求淹没。
 
 ### 4.2 迁移规则
 
@@ -166,7 +196,7 @@ PostgreSQL 自动释放，因此不得将其改为可能遗留陈旧状态的普
 | --- | --- |
 | `researchers` | AI 研究员的基本资料 |
 | `youtube_channels` | 研究员与 YouTube 频道的关联、启用状态和最近检查时间 |
-| `videos` | 视频元数据和字幕下载时间 |
+| `videos` | 视频元数据、字幕内容状态、数值下载调度状态和最近下载错误 |
 | `subtitle_tracks` | 原始、规范化及翻译字幕；区分语言、人工/自动来源和原始内容版本 |
 | `analysis_runs` | Codex 执行批次、视频/字幕身份、模型、提示词版本、状态和运行元数据 |
 | `agent_invocations` | 每次 Agent 调用的结构化输入、完整提示词、流式事件、原始/解析输出和错误 |
@@ -177,7 +207,7 @@ PostgreSQL 自动释放，因此不得将其改为可能遗留陈旧状态的普
 `schema_migrations` 由迁移脚本维护，不属于业务表，其中保存迁移文件名、SHA-256
 和应用时间。主键使用 UUID；关键外键、唯一约束、0 到 100 的评分范围约束及列表
 查询常用索引由迁移创建。当前迁移链截至
-`010_channel_profile.sql`：
+`011_subtitle_download_status.sql`：
 
 - `002` 约束分析引用的字幕必须属于同一视频。
 - `003` 增加翻译字段与元数据、run 的视频/字幕身份、分析 profile、输出 Schema 版本、
@@ -191,6 +221,8 @@ PostgreSQL 自动释放，因此不得将其改为可能遗留陈旧状态的普
 - `008` 增加 `agent_invocations`，按 run、阶段和序号保存完整 Agent 调试记录。
 - `009` 增加 Agent 取消状态，并约束终态错误字段和开始/结束时间顺序。
 - `010` 增加频道原始简介和头像地址，供展示端呈现频道资料。
+- `011` 增加数值字幕下载状态和最近错误，回填历史数据，并为待下载优先、失败队尾重试建立
+  部分索引。
 
 完整 Agent 输出保存在 `video_analyses.raw_agent_output` JSONB，以允许 Schema 演进；
 稳定查询字段通过 `pipeline/config/pipeline.toml` 中的 JSON Pointer 投影到关系字段。
@@ -207,11 +239,11 @@ profile、Schema 版本和提示词版本共同决定是否复用已有分析。
 ./db/test_migrations.sh
 ```
 
-第一次执行应创建数据库并应用所有未执行迁移；第二次执行应对 `001` 至 `010` 均输出
+第一次执行应创建数据库并应用所有未执行迁移；第二次执行应对 `001` 至 `011` 均输出
 `Skipping ...`。
 测试脚本会预留并标记一个高熵名称的临时数据库，验证空库并发迁移、重复执行、
-环境变量优先级、迁移校验和、失败回滚、表结构、跨视频字幕约束和删除字幕后的
-引用清理，结束时自动删除临时数据库和测试文件。
+环境变量优先级、迁移校验和、失败回滚、表结构、下载状态约束与历史回填、跨视频字幕约束
+和删除字幕后的引用清理，结束时自动删除临时数据库和测试文件。
 
 可以使用以下命令检查项目数据库的迁移记录和表：
 

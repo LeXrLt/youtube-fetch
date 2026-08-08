@@ -10,7 +10,8 @@ const navItems = [
     href: "/subtitles",
     label: "字幕",
     icon: Captions,
-    matches: (path: string) => path.startsWith("/subtitles"),
+    matches: (path: string) =>
+      path.startsWith("/subtitles") || path.startsWith("/posts/"),
   },
   {
     href: "/tags",

@@ -87,10 +87,12 @@ pipeline/.venv/bin/python pipeline/main.py channel-inspect '@example'
 其他数据库相关命令在执行业务操作前都会自动运行 `db/migrate.sh`；迁移失败时业务操作
 不会开始。
 
-`run` 和 `video` 使用 PostgreSQL 会话级 advisory lock，同一个项目数据库同一时间只允许
-一个高资源 Pipeline 任务运行。若锁已被其他进程持有，新任务会立即退出，不会排队；任务
-正常结束、异常退出、进程崩溃或数据库连接断开后，PostgreSQL 会自动释放锁。
-`config-check`、`migrate`、`channel-inspect` 和 `channel-add` 不占用该运行锁。
+抓取和分析使用两把 PostgreSQL 会话级 advisory lock。同一个项目数据库同一时间最多运行
+一个下载阶段和一个分析阶段，但下载与分析可彼此并行。`download`、`analyze` 分别持有对应
+锁；`run` 和 `video` 依次持有下载锁、释放，再持有分析锁，不会同时占用两把锁。同类锁被
+其他进程持有时，新任务立即退出而不排队；连接关闭时 PostgreSQL 自动释放锁。
+下载任务被取消时会先等待正在运行的 yt-dlp 工作线程结束，再释放并发配额和下载锁。
+`config-check`、`migrate`、`channel-inspect` 和 `channel-add` 不占用阶段锁。
 
 ```bash
 # 仅创建数据库并应用全部未执行迁移
@@ -100,44 +102,103 @@ pipeline/.venv/bin/python pipeline/main.py migrate
 pipeline/.venv/bin/python pipeline/main.py channel-add \
   'https://www.youtube.com/@example' --researcher '研究员姓名'
 
-# 抓取并分析单个视频
+# 抓取并分析单个视频；内部先持久化字幕，再进入分析阶段
 pipeline/.venv/bin/python pipeline/main.py video \
   'https://www.youtube.com/watch?v=VIDEO_ID'
 
-# 未指定频道时，处理 youtube_channels 表中全部启用频道
+# 只发现视频并下载、规范化字幕，不调用 Codex
+pipeline/.venv/bin/python pipeline/main.py download
+
+# 只分析 PostgreSQL 中的待处理字幕，不访问 YouTube；0 表示不限量
+pipeline/.venv/bin/python pipeline/main.py analyze --limit 20
+
+# 兼容的一体化命令：全部频道下载完成后，再分析当前全部待处理字幕
 pipeline/.venv/bin/python pipeline/main.py run
 
-# 只处理显式频道；--channel 可重复
+# 下载阶段只处理显式频道；--channel 可重复，后续分析仍消费全局候选
 pipeline/.venv/bin/python pipeline/main.py run \
   --channel 'https://www.youtube.com/@first' \
   --channel 'https://www.youtube.com/@second'
 
-# 临时限制每个频道的数量；0 表示不限量
-pipeline/.venv/bin/python pipeline/main.py run --max-videos-per-channel 5
+# 下载阶段临时限制每个频道的数量；0 表示不限量
+pipeline/.venv/bin/python pipeline/main.py download --max-videos-per-channel 5
 ```
 
-命中相同字幕、profile、Schema 版本、提示词版本及相关内容哈希的成功分析时，`video`
-和 `run` 返回 `skipped`。`--force` 可显式创建新的分析 revision：
+生产环境建议把两个阶段配置成独立调度任务，例如高频运行 `download`，并按机器可承受的
+Codex 负载运行 `analyze --limit N`。两条命令可以同时执行；分析命令启动时会固定本轮候选
+视频集合，新加入的视频由下一轮处理。若候选视频在轮到分析前被 `download --force` 写入
+新版字幕，本轮会读取执行时的最新版本，完整身份校验仍会防止错误复用。下载已入库后即形成
+恢复边界，即使分析失败、被取消或因分析锁竞争而未启动，后续 `analyze` 仍会从 PostgreSQL
+继续，不必重新抓取。
+
+命中相同字幕、profile、Schema 版本、提示词版本及相关内容哈希的成功分析时，分析阶段返回
+`skipped`。`--force` 作用于命令包含的阶段：
 
 ```bash
 pipeline/.venv/bin/python pipeline/main.py video VIDEO_URL --force
 pipeline/.venv/bin/python pipeline/main.py run --force
+pipeline/.venv/bin/python pipeline/main.py download --force
+pipeline/.venv/bin/python pipeline/main.py analyze --limit 20 --force
 ```
 
-未指定 `--channel` 时，`run` 从 PostgreSQL 的 `youtube_channels` 表读取
+独立 `download --force` 只强制重新抓取，独立 `analyze --force` 只创建新分析 revision；
+`run --force` 和 `video --force` 同时作用于两个阶段。对 `analyze --force` 使用不限量设置会
+重新分析所有具有有效最新字幕的视频，生产调度应配合 `--limit` 谨慎使用。
+
+未指定 `--channel` 时，`download` 和 `run` 从 PostgreSQL 的 `youtube_channels` 表读取
 `is_active = true` 的频道；不会读取或同步 Cookie 登录用户的订阅列表。Web 管理页新增或
 重新启用的频道会进入默认抓取范围，停用频道及其历史数据仍保留在数据库中。
 
-默认 `max_videos_per_channel = 0`，因此首次发现频道时枚举完整视频历史；只有不限量扫描
-且本频道没有失败时，才会记录首次回填完成时间。每个视频的元数据、字幕、翻译和分析
-均独立提交。后续运行先按 YouTube video ID 查询 PostgreSQL：完整分析直接跳过，失败的
-分析从已保存字幕或匹配版本的翻译继续，无字幕和无效字幕状态也不重复抓取。进程中断后
-重新执行同一命令即可恢复；`--force` 会绕过这些复用状态并重新抓取、翻译和分析。
-为发现新增视频，普通运行仍会枚举频道索引，但不会再次下载或分析已命中的视频。
+频道发现固定读取频道 ID 对应的 YouTube Uploads playlist。默认
+`max_videos_per_channel = 0`，因此首次回填会枚举完整视频历史；配置正数限制时，每次只登记
+指定数量的未发现视频，后续运行继续向旧视频推进。只有实际枚举到 playlist 末尾、且本次
+发现的引用全部成功幂等入队后，才立即写入 `initial_backfill_completed_at`。该 marker 与字幕
+下载、规范化及分析结果无关，所以字幕随后失败不会撤销首次回填完成状态。
 
-`run` 逐频道、逐视频处理；单个视频或频道失败会记录为 `failed` 并继续，结果中只要存在
-失败，进程退出码即为 1。正数 `--max-videos-per-channel` 只用于开发或运维抽样，不会把
-频道标记为已完成首次全量回填。
+首次回填完成后，普通运行按 Uploads playlist 从最新视频向后扫描，遇到本轮启动前数据库中
+已有的 YouTube video ID 就停止；无需再次枚举频道全部历史。这里所有已登记视频都是可信
+边界，无论 `subtitle_download_status` 为 `0`、`1` 还是 `2`。状态 `2` 的字幕任务仍由全局
+队列在待下载任务之后重试，不依赖频道发现再次越过该视频。增量模式以已知边界为准，即使
+设置了正数 `--max-videos-per-channel`，也会先扫描完边界前的全部新增视频。
+
+`--force` 不在已知 video ID 处停止：不限量时重新枚举完整 Uploads playlist，显式设置正数
+限制时最多发现该数量的视频，并对本次发现范围内的既有视频强制重新抓取。升级旧数据
+时，如果频道已有视频但 `initial_backfill_completed_at` 仍为空，下一次普通运行会再完整扫描
+一次（或按显式限制分批扫完）以建立可信增量边界；这是预期的一次性升级成本。
+
+下载阶段按
+`[pipeline].download_concurrency` 对频道发现和视频字幕抓取做统一的有界异步并发，默认值
+为 `4`，允许范围为 `1` 至 `16`。该限制用于控制并发 HTTP、文件和数据库 I/O；分析阶段
+保持逐视频执行，避免同时启动多个 Codex 任务造成额外资源压力。
+
+频道索引发现后先把视频引用写入 PostgreSQL，再生成一次固定的全局下载队列。数值字段
+`videos.subtitle_download_status` 使用 `0=待下载`、`1=已下载`、`2=下载失败`：所有 `0`
+排在历史 `2` 前面；单视频失败会保存错误、继续后续任务，并只在下一次启动时于队尾重试。
+一次运行不会重新读取队列，因此本轮失败不会立即反复执行。即使
+`--max-videos-per-channel` 限制了本轮频道发现范围，该频道以前遗留的 `0` 和 `2` 仍会恢复。
+
+每个视频的完整元数据和字幕在下载阶段独立提交；翻译与分析在后续分析阶段独立提交。
+`subtitle_status` 继续区分 `pending`、`fetched`、`unavailable` 和 `invalid` 等内容状态；确认
+无字幕或字幕无法规范化也属于下载完成，数值状态为 `1`，普通下载不会重复抓取。分析阶段只
+读取每个视频最新且可规范化的字幕，并跳过已有匹配成功 revision 的视频；失败或取消的分析
+可在下一轮恢复。
+
+全局 `--log-level` 默认是 `INFO`。默认日志隐藏 yt-dlp 的网页、播放器 API 等底层请求进度，
+但保留其警告和错误；使用 `--log-level DEBUG` 才会看到这些底层消息和异常堆栈。`INFO` 直接
+记录频道发现模式、发现数量与停止原因，以及字幕队列总数和 `pending`/`retry`/`forced` 分类；
+每个字幕任务会记录开始，并明确区分下载成功、未匹配到字幕、字幕无法规范化、跳过和失败。
+重试任务在日志上下文中标为 `queue=retry`，无需依赖 yt-dlp 请求明细判断恢复进度。
+
+`run` 保留原参数，但执行顺序固定为“完成所有频道下载，再分析整个数据库的当前候选列表”，
+其 JSON 结果是两个阶段结果组成的扁平列表。`--channel` 和
+`--max-videos-per-channel` 只约束下载阶段，不限制随后启动的全局分析数量；需要控制 Codex
+工作量时应改用独立的 `analyze --limit N`。任一阶段出现 `failed` 时进程退出码为 1；单个
+视频或频道失败不会取消同阶段的其他任务。正数 `--max-videos-per-channel` 会分批推进首次
+回填，并只在确认 Uploads playlist 已耗尽后标记完成。`analyze --limit 0` 表示不限量，所有
+数量限制都拒绝负数。
+
+该队列状态由 `011_subtitle_download_status.sql` 添加；Pipeline 业务命令启动时会自动执行
+迁移，独立部署 Web 时需先运行 `./db/migrate.sh`。
 
 ## 字幕选择与处理
 

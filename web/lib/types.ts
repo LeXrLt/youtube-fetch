@@ -43,6 +43,31 @@ export interface FeedPost {
   tags: FeedTag[];
 }
 
+export interface AnalysisSource {
+  title: string;
+  url: string;
+  note: string;
+}
+
+export interface PostAnalysis {
+  isRelevant: boolean;
+  relevanceScore: number | null;
+  qualityScore: number | null;
+  summary: string | null;
+  backgroundNotes: string | null;
+  keyPoints: string[];
+  filterReason: string | null;
+  sources: AnalysisSource[];
+  analyzedAt: string;
+}
+
+export interface PostDetail {
+  post: FeedPost;
+  translatedTranscript: string | null;
+  translatedLanguageCode: string | null;
+  analysis: PostAnalysis | null;
+}
+
 export interface PaginatedResult<T> {
   items: T[];
   page: number;

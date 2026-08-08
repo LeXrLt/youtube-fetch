@@ -42,6 +42,12 @@ class DatabaseSettings(BaseModel):
         return self
 
 
+class PipelineSettings(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    download_concurrency: int = Field(default=4, ge=1, le=16)
+
+
 class YoutubeSettings(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -124,6 +130,7 @@ class RuntimeSettings(BaseModel):
 
     project_root: Path
     pipeline_root: Path
+    pipeline: PipelineSettings
     database: DatabaseSettings
     youtube: YoutubeSettings
     agent: AgentSettings
@@ -172,6 +179,7 @@ def _load_settings(config_path: Path, env_path: Path) -> RuntimeSettings:
     if missing:
         raise ValueError(f"Missing database environment variables: {', '.join(missing)}")
 
+    pipeline = PipelineSettings.model_validate(config_data.get("pipeline", {}))
     database_data = config_data.get("database", {})
     database = DatabaseSettings(
         host=environment.get("POSTGRES_HOST", "localhost"),
@@ -211,6 +219,7 @@ def _load_settings(config_path: Path, env_path: Path) -> RuntimeSettings:
     return RuntimeSettings(
         project_root=PROJECT_ROOT,
         pipeline_root=PIPELINE_ROOT,
+        pipeline=pipeline,
         database=database,
         youtube=youtube,
         agent=agent,

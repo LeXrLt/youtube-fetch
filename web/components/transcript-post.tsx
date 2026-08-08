@@ -2,8 +2,9 @@ import { Clock3, ExternalLink, Languages, Play } from "lucide-react";
 import Link from "next/link";
 
 import { Avatar } from "@/components/avatar";
-import { TranscriptBody } from "@/components/transcript-body";
+import { formatDuration, formatPostDate } from "@/lib/post-format";
 import { safeHttpUrl } from "@/lib/public-url";
+import { buildTranscriptPreview } from "@/lib/transcript-preview";
 
 export type TranscriptPostView = {
   videoId: string;
@@ -33,41 +34,29 @@ export type TranscriptPostView = {
   }>;
 };
 
-function formatPublishedAt(value: string | null) {
-  if (!value) return "日期未知";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "日期未知";
-  return new Intl.DateTimeFormat("zh-CN", {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    timeZone: "Asia/Shanghai",
-  }).format(date);
-}
-
-function formatDuration(seconds: number | null) {
-  if (seconds === null) return null;
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const remainingSeconds = seconds % 60;
-  return hours > 0
-    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`
-    : `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
-}
-
 export function TranscriptPost({
   post,
   mode,
 }: Readonly<{ post: TranscriptPostView; mode: "translated" | "original" }>) {
-  const date = formatPublishedAt(post.publishedAt);
+  const date = formatPostDate(post.publishedAt);
   const duration = formatDuration(post.durationSeconds);
   const videoUrl = safeHttpUrl(post.videoUrl);
   const language =
     mode === "translated" ? "简体中文" : post.languageName || post.languageCode;
+  const preview = buildTranscriptPreview(post.transcript);
+  const detailHref =
+    mode === "translated"
+      ? `/posts/${post.subtitleId}?mode=translated`
+      : `/posts/${post.subtitleId}`;
+  const titleId = `post-title-${post.subtitleId}`;
 
   return (
-    <article className="transcript-post">
-      <Link href={`/channels/${post.channel.id}`} aria-label={`查看${post.channel.title}`}>
+    <article className="transcript-post" aria-labelledby={titleId}>
+      <Link
+        className="post-avatar-link"
+        href={`/channels/${post.channel.id}`}
+        aria-label={`查看${post.channel.title}`}
+      >
         <Avatar src={post.channel.avatarUrl} name={post.channel.title} />
       </Link>
 
@@ -97,14 +86,10 @@ export function TranscriptPost({
           ) : null}
         </div>
 
-        <h2 className="post-title">
-          {videoUrl ? (
-            <a href={videoUrl} target="_blank" rel="noopener noreferrer">
-              {post.videoTitle}
-            </a>
-          ) : (
-            post.videoTitle
-          )}
+        <h2 className="post-title" id={titleId}>
+          <Link className="post-detail-link" href={detailHref}>
+            {post.videoTitle}
+          </Link>
         </h2>
 
         <div className="post-meta">
@@ -121,7 +106,10 @@ export function TranscriptPost({
           ) : null}
         </div>
 
-        <TranscriptBody text={post.transcript} />
+        <p className="transcript-copy transcript-preview">
+          {preview.text}
+          {preview.isTruncated ? <span aria-hidden="true">…</span> : null}
+        </p>
 
         {videoUrl ? (
           <a
@@ -152,15 +140,17 @@ export function TranscriptPost({
           </a>
         ) : null}
 
-        {post.tags.length ? (
-          <footer className="post-footer" aria-label="标签">
-            {post.tags.map((tag) => (
+        <footer className="post-footer" aria-label="标签">
+          {post.tags.length ? (
+            post.tags.map((tag) => (
               <Link className="tag-chip" href={`/tags/${tag.id}`} key={tag.id}>
                 #{tag.name}
               </Link>
-            ))}
-          </footer>
-        ) : null}
+            ))
+          ) : (
+            <span className="post-tags-empty">暂无标签</span>
+          )}
+        </footer>
       </div>
     </article>
   );

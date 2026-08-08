@@ -15,7 +15,7 @@ test("requires the configured route key", async ({ request }) => {
   expect(protectedResponse.status()).toBe(200);
 });
 
-test("navigates the live feeds and expands a transcript", async ({ page }) => {
+test("opens a full transcript from the 100-character feed preview", async ({ page }) => {
   await page.goto(withWebBasePath("/"));
 
   await expect(page.getByRole("heading", { name: "首页", level: 1 })).toBeVisible();
@@ -23,13 +23,58 @@ test("navigates the live feeds and expands a transcript", async ({ page }) => {
   await expect(firstPost).toBeVisible();
   await expect(firstPost.getByText("简体中文", { exact: true })).toBeVisible();
 
-  const transcript = firstPost.locator(".transcript-copy");
-  await expect(transcript).toHaveClass(/is-collapsed/);
-  await firstPost.getByRole("button", { name: "展开全文" }).click();
-  await expect(transcript).not.toHaveClass(/is-collapsed/);
+  const preview = (await firstPost.locator(".transcript-preview").textContent()) ?? "";
+  expect(Array.from(preview).length).toBeLessThanOrEqual(101);
+  if (preview.endsWith("…")) {
+    expect(Array.from(preview)).toHaveLength(101);
+  }
+  await expect(firstPost.getByRole("button", { name: "展开全文" })).toHaveCount(0);
+
+  const detailLink = firstPost.locator(".post-detail-link");
+  const detailHref = await detailLink.getAttribute("href");
+  expect(detailHref).not.toBeNull();
+  const detailUrl = new URL(detailHref ?? "", page.url());
+  expect(detailUrl.pathname).toMatch(
+    new RegExp(
+      `^${withWebBasePath("/posts/")}[0-9a-f-]{36}$`,
+    ),
+  );
+  expect(detailUrl.searchParams.get("mode")).toBe("translated");
+
+  await detailLink.click();
+  await expect(page).toHaveURL(detailUrl.href);
+  await expect(page.getByRole("heading", { name: "字幕全文", level: 2 })).toBeVisible();
+  const fullTranscript =
+    (await page.locator(".post-detail-transcript").textContent()) ?? "";
+  const normalizedFullTranscript = fullTranscript.replace(/\s+/g, " ").trim();
+  const previewText = preview.endsWith("…")
+    ? Array.from(preview).slice(0, 100).join("")
+    : preview;
+  expect(normalizedFullTranscript.startsWith(previewText)).toBe(true);
+  const analysisRail = page.getByRole("complementary", { name: "AI 分析" });
+  await expect(analysisRail).toBeVisible();
+
+  const timelineBox = await page.locator("main.timeline-column").boundingBox();
+  const analysisBox = await analysisRail.boundingBox();
+  expect(timelineBox).not.toBeNull();
+  expect(analysisBox).not.toBeNull();
+  const detailTabs = page.getByRole("navigation", { name: "详情内容" });
+  if ((page.viewportSize()?.width ?? 0) > 1050) {
+    await expect(detailTabs).toBeHidden();
+    expect(analysisBox?.x).toBeGreaterThanOrEqual(
+      (timelineBox?.x ?? 0) + (timelineBox?.width ?? 0) - 1,
+    );
+  } else {
+    await expect(detailTabs).toBeVisible();
+    expect(analysisBox?.y).toBeGreaterThanOrEqual(
+      (timelineBox?.y ?? 0) + (timelineBox?.height ?? 0) - 1,
+    );
+  }
 
   await page.getByRole("link", { name: "字幕", exact: true }).click();
-  await expect(page).toHaveURL(/\/subtitles$/);
+  await page.waitForURL(
+    (url) => url.pathname === withWebBasePath("/subtitles"),
+  );
   await expect(page.getByRole("heading", { name: "字幕", level: 1 })).toBeVisible();
   await expect(page.locator("article.transcript-post").first()).toBeVisible();
 });
@@ -48,7 +93,49 @@ test("filters tags and opens the corresponding original transcript", async ({ pa
 
   await expect(page.getByRole("heading", { name: `#${firstName}`, level: 1 })).toBeVisible();
   await expect(page.getByRole("heading", { name: "原字幕", level: 2 })).toBeVisible();
-  await expect(page.locator("article.transcript-post").first()).toBeVisible();
+  const firstPost = page.locator("article.transcript-post").first();
+  await expect(firstPost).toBeVisible();
+
+  const tagLink = firstPost.getByRole("link", { name: `#${firstName}`, exact: true });
+  await expect(tagLink).toBeVisible();
+  await tagLink.click();
+  await expect(page.getByRole("heading", { name: `#${firstName}`, level: 1 })).toBeVisible();
+
+  const detailLink = page
+    .locator("article.transcript-post")
+    .first()
+    .locator(".post-detail-link");
+  const detailHref = await detailLink.getAttribute("href");
+  expect(detailHref).not.toBeNull();
+  const detailUrl = new URL(detailHref ?? "", page.url());
+  expect(detailUrl.pathname).toMatch(
+    new RegExp(`^${withWebBasePath("/posts/")}[0-9a-f-]{36}$`),
+  );
+  expect(detailUrl.searchParams.has("mode")).toBe(false);
+
+  await detailLink.click();
+  await expect(page).toHaveURL(detailUrl.href);
+  await expect(page.getByRole("heading", { name: "字幕全文", level: 2 })).toBeVisible();
+  await expect(
+    page.locator(".post-detail-tags").getByRole("link", {
+      name: `#${firstName}`,
+      exact: true,
+    }),
+  ).toBeVisible();
+  const analysis = page.getByRole("complementary", { name: "AI 分析" });
+  await expect(analysis.getByRole("heading", { name: "AI 分析", level: 2 })).toBeVisible();
+  await expect(analysis.locator(".analysis-status")).toBeVisible();
+  await expect(
+    analysis.locator(".analysis-tags").getByRole("link", {
+      name: `#${firstName}`,
+      exact: true,
+    }),
+  ).toBeVisible();
+
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+  expect(overflow).toBeLessThanOrEqual(1);
 });
 
 test("shows the stored channel profile without horizontal overflow", async ({ page }) => {

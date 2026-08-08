@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import IntEnum
 from typing import Any
 from uuid import UUID
 
@@ -64,10 +65,33 @@ class FetchedVideo:
     subtitle: DownloadedSubtitle | None
 
 
+class SubtitleDownloadStatus(IntEnum):
+    PENDING = 0
+    DOWNLOADED = 1
+    FAILED = 2
+
+
 @dataclass(frozen=True, slots=True)
 class VideoReference:
     youtube_video_id: str
     video_url: str
+    title: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VideoDiscoveryResult:
+    references: list[VideoReference]
+    source_exhausted: bool
+    stopped_at_known: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SubtitleDownloadTask:
+    channel_id: UUID
+    youtube_video_id: str
+    video_url: str
+    title: str
+    status: SubtitleDownloadStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +100,7 @@ class StoredVideo:
     subtitle_track_id: UUID | None
     fetched: FetchedVideo
     subtitle_status: str
+    subtitle_download_status: SubtitleDownloadStatus
     translated_text: str | None
     translated_language_code: str | None
     translation_metadata: dict[str, Any]

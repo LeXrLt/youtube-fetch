@@ -1,4 +1,4 @@
-import type { FeedQueryInput, SearchParamValue } from "./types";
+import type { FeedMode, FeedQueryInput, SearchParamValue } from "./types";
 
 export const PAGE_SIZE = 12;
 export const MAX_PAGE = 10_000;
@@ -40,6 +40,10 @@ export function parseQuery(value: SearchParamValue): string {
 
   const normalized = candidate.replaceAll("\0", "").trim();
   return Array.from(normalized).slice(0, MAX_QUERY_LENGTH).join("");
+}
+
+export function parsePostMode(value: SearchParamValue): FeedMode {
+  return firstValue(value) === "translated" ? "translated" : "original";
 }
 
 export function parseFeedQuery(input: FeedQueryInput = {}): ParsedFeedQuery {

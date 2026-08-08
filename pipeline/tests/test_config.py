@@ -4,8 +4,13 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from config import PIPELINE_ROOT, load_settings
+from config import PIPELINE_ROOT, PipelineSettings, load_settings
+
+
+def test_pipeline_settings_defaults_download_concurrency_to_four() -> None:
+    assert PipelineSettings().download_concurrency == 4
 
 
 @pytest.mark.asyncio
@@ -32,6 +37,20 @@ async def test_load_settings_prefers_process_environment(
     assert settings.database.user == "environment-user"
     assert settings.database.database == "environment-db"
     assert settings.database.password.get_secret_value() == "environment-password"
+    assert settings.pipeline.download_concurrency == 4
+
+
+@pytest.mark.parametrize("value", [0, 17])
+def test_pipeline_settings_rejects_invalid_download_concurrency(value: int) -> None:
+    with pytest.raises(ValidationError, match="download_concurrency"):
+        PipelineSettings(download_concurrency=value)
+
+
+@pytest.mark.parametrize("value", [1, 16])
+def test_pipeline_settings_accepts_download_concurrency_bounds(value: int) -> None:
+    settings = PipelineSettings(download_concurrency=value)
+
+    assert settings.download_concurrency == value
 
 
 @pytest.mark.asyncio

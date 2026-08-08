@@ -4,6 +4,7 @@ import { PAGE_SIZE, buildLikePattern } from "./query-params";
 import {
   buildFeedQueries,
   buildManagedChannelsQuery,
+  buildPostDetailQuery,
   buildSetChannelActiveQuery,
   buildTagFeedQueries,
   buildTagSummaryQuery,
@@ -13,6 +14,7 @@ import {
 
 const CHANNEL_ID = "28f5f390-62e7-4f27-a478-75d46c331b77";
 const TAG_ID = "9d3dd442-ab51-4dd3-8435-952e69f6cfc2";
+const POST_ID = "9e01cc68-bf41-4d1e-9e30-3bf66f11de35";
 
 describe("buildFeedQueries", () => {
   it("selects the latest zh-CN subtitle and parameterizes search and pagination", () => {
@@ -81,6 +83,26 @@ describe("tag query builders", () => {
     expect(query.text).toContain("WHERE tag.id = $1::uuid");
     expect(query.text).not.toContain(TAG_ID);
     expect(query.values).toEqual([TAG_ID]);
+  });
+});
+
+describe("buildPostDetailQuery", () => {
+  it("keeps the subtitle and latest succeeded analysis on the same revision", () => {
+    const query = buildPostDetailQuery(POST_ID);
+
+    expect(query.text).toContain("WHERE subtitle.id = $1::uuid");
+    expect(query.text).toContain("analysis.video_id = video.id");
+    expect(query.text).toContain("analysis.subtitle_track_id = subtitle.id");
+    expect(query.text).toContain("analysis_run.status = 'succeeded'");
+    expect(query.text).toContain("analysis.analyzed_at DESC");
+    expect(query.text).toContain(
+      "association.video_analysis_id = latest_analysis.id",
+    );
+    expect(query.text).toContain("latest_analysis.profile_name = 'default'");
+    expect(query.text).toContain("latest_analysis.output_schema_version = '1'");
+    expect(query.text).toContain("latest_analysis.raw_agent_output -> 'sources'");
+    expect(query.text).not.toContain(POST_ID);
+    expect(query.values).toEqual([POST_ID]);
   });
 });
 

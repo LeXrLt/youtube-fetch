@@ -21,7 +21,7 @@ test("opens a full transcript from the 100-character feed preview", async ({ pag
   await expect(page.getByRole("heading", { name: "首页", level: 1 })).toBeVisible();
   const firstPost = page.locator("article.transcript-post").first();
   await expect(firstPost).toBeVisible();
-  await expect(firstPost.getByText("简体中文", { exact: true })).toBeVisible();
+  await expect(firstPost.getByText("中文", { exact: true })).toBeVisible();
 
   const preview = (await firstPost.locator(".transcript-preview").textContent()) ?? "";
   expect(Array.from(preview).length).toBeLessThanOrEqual(101);

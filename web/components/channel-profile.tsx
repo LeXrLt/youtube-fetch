@@ -23,7 +23,7 @@ export function ChannelProfile({ channel }: Readonly<{ channel: ChannelSummary }
 
       <div className="channel-stats">
         <span className="channel-stat">
-          <strong>{channel.postCount.toLocaleString("zh-CN")}</strong> 条字幕
+          <strong>{channel.postCount.toLocaleString("zh-CN")}</strong> 条中文字幕
         </span>
       </div>
 

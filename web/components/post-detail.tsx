@@ -26,7 +26,7 @@ export function PostDetail({
       ? detail.translatedTranscript
       : post.transcript;
   const language =
-    mode === "translated" ? "简体中文" : post.languageName || post.languageCode;
+    mode === "translated" ? "中文" : post.languageName || post.languageCode;
   const backHref = mode === "translated" ? "/" : "/subtitles";
   const backLabel = mode === "translated" ? "返回首页" : "返回字幕";
 

@@ -37,7 +37,7 @@ export default async function ChannelDetailPage(
     >
       <ChannelProfile channel={detail.channel} />
       <FeedHeader
-        title="简中字幕"
+        title="中文字幕"
         count={detail.posts.totalItems}
         query={query.q}
         searchAction={basePath}
@@ -46,7 +46,7 @@ export default async function ChannelDetailPage(
       <Feed
         posts={detail.posts.items}
         mode="translated"
-        emptyTitle={query.q ? "没有匹配的简中字幕" : "这个博主暂无简中字幕"}
+        emptyTitle={query.q ? "没有匹配的中文字幕" : "这个博主暂无中文字幕"}
       />
       <Pagination
         basePath={basePath}

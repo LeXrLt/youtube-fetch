@@ -37,7 +37,7 @@ export function DiscoveryRail({
               <span className="rail-channel-copy">
                 <span className="rail-primary">{channel.title}</span>
                 <span className="rail-secondary">
-                  {channel.description || channel.handle || `${channel.postCount} 条字幕`}
+                  {channel.description || channel.handle || `${channel.postCount} 条中文字幕`}
                 </span>
               </span>
             </Link>

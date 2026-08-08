@@ -59,6 +59,14 @@ current_analyses AS (
     analysis.id DESC
 )`;
 
+const DISPLAYABLE_CHINESE_TRANSLATION = `(
+  (
+    lower(subtitle.translated_language_code) = 'zh'
+    OR lower(subtitle.translated_language_code) LIKE 'zh-%'
+  )
+  AND NULLIF(btrim(subtitle.translated_text), '') IS NOT NULL
+)`;
+
 const POST_TAGS_LATERAL = `
 LEFT JOIN LATERAL (
   SELECT jsonb_agg(
@@ -118,8 +126,7 @@ export function buildFeedQueries(options: FeedQueryOptions): PagedSqlQueries {
   const conditions: string[] = [];
 
   if (options.mode === "translated") {
-    conditions.push("subtitle.translated_language_code = 'zh-CN'");
-    conditions.push("NULLIF(btrim(subtitle.translated_text), '') IS NOT NULL");
+    conditions.push(DISPLAYABLE_CHINESE_TRANSLATION);
   }
 
   if (options.channelId) {
@@ -406,7 +413,9 @@ SELECT
   channel.channel_url,
   channel.description,
   channel.avatar_url,
-  count(subtitle.id) AS post_count
+  count(subtitle.id) FILTER (
+    WHERE ${DISPLAYABLE_CHINESE_TRANSLATION}
+  ) AS post_count
 FROM youtube_channels AS channel
 LEFT JOIN videos AS video ON video.channel_id = channel.id
 LEFT JOIN latest_subtitles AS subtitle ON subtitle.video_id = video.id
@@ -432,7 +441,9 @@ SELECT
   channel.channel_url,
   channel.description,
   channel.avatar_url,
-  count(subtitle.id) AS post_count
+  count(subtitle.id) FILTER (
+    WHERE ${DISPLAYABLE_CHINESE_TRANSLATION}
+  ) AS post_count
 FROM youtube_channels AS channel
 LEFT JOIN videos AS video ON video.channel_id = channel.id
 LEFT JOIN latest_subtitles AS subtitle ON subtitle.video_id = video.id
@@ -462,7 +473,9 @@ SELECT
   channel.description,
   channel.avatar_url,
   channel.is_active,
-  count(subtitle.id) AS post_count
+  count(subtitle.id) FILTER (
+    WHERE ${DISPLAYABLE_CHINESE_TRANSLATION}
+  ) AS post_count
 FROM youtube_channels AS channel
 LEFT JOIN videos AS video ON video.channel_id = channel.id
 LEFT JOIN latest_subtitles AS subtitle ON subtitle.video_id = video.id

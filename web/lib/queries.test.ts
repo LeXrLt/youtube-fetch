@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import { PAGE_SIZE, buildLikePattern } from "./query-params";
 import {
+  buildChannelSummaryQuery,
   buildFeedQueries,
   buildManagedChannelsQuery,
   buildPostDetailQuery,
   buildSetChannelActiveQuery,
+  buildSidebarChannelsQuery,
   buildTagFeedQueries,
   buildTagSummaryQuery,
   buildTagsQuery,
@@ -17,7 +19,7 @@ const TAG_ID = "9d3dd442-ab51-4dd3-8435-952e69f6cfc2";
 const POST_ID = "9e01cc68-bf41-4d1e-9e30-3bf66f11de35";
 
 describe("buildFeedQueries", () => {
-  it("selects the latest zh-CN subtitle and parameterizes search and pagination", () => {
+  it("selects the latest Chinese translation and parameterizes search and pagination", () => {
     const attack = "100%_' OR true --";
     const query = buildFeedQueries({ mode: "translated", q: attack, page: 2 });
 
@@ -25,7 +27,15 @@ describe("buildFeedQueries", () => {
     expect(query.count.text).toContain("subtitle.fetched_at DESC");
     expect(query.count.text).toContain("subtitle.created_at DESC");
     expect(query.count.text).toContain("subtitle.id DESC");
-    expect(query.count.text).toContain("subtitle.translated_language_code = 'zh-CN'");
+    expect(query.count.text).toContain(
+      "lower(subtitle.translated_language_code) = 'zh'",
+    );
+    expect(query.count.text).toContain(
+      "lower(subtitle.translated_language_code) LIKE 'zh-%'",
+    );
+    expect(query.count.text).not.toContain(
+      "subtitle.translated_language_code = 'zh-CN'",
+    );
     expect(query.count.text).toContain("NULLIF(btrim(subtitle.translated_text), '') IS NOT NULL");
     expect(query.rows.text).toContain("analysis_run.status = 'succeeded'");
     expect(query.rows.text).toContain("analysis.subtitle_track_id = post.subtitle_id");
@@ -107,6 +117,27 @@ describe("buildPostDetailQuery", () => {
 });
 
 describe("channel management query builders", () => {
+  it("uses displayable Chinese translation counts for channel links", () => {
+    const queries = [
+      buildChannelSummaryQuery(CHANNEL_ID),
+      buildSidebarChannelsQuery(12),
+      buildManagedChannelsQuery(),
+    ];
+
+    for (const query of queries) {
+      expect(query.text).toContain("count(subtitle.id) FILTER");
+      expect(query.text).toContain(
+        "lower(subtitle.translated_language_code) = 'zh'",
+      );
+      expect(query.text).toContain(
+        "lower(subtitle.translated_language_code) LIKE 'zh-%'",
+      );
+      expect(query.text).toContain(
+        "NULLIF(btrim(subtitle.translated_text), '') IS NOT NULL",
+      );
+    }
+  });
+
   it("lists active channels first without hiding inactive channels", () => {
     const query = buildManagedChannelsQuery();
 

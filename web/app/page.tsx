@@ -33,7 +33,7 @@ export default async function Home(props: PageProps<"/">) {
       <Feed
         posts={feed.items}
         mode="translated"
-        emptyTitle={query.q ? "没有匹配的简中字幕" : "暂无简中字幕"}
+        emptyTitle={query.q ? "没有匹配的中文字幕" : "暂无中文字幕"}
         emptyDetail={query.q ? `未找到与“${query.q}”相关的内容` : undefined}
       />
       <Pagination

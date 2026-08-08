@@ -42,7 +42,7 @@ export function TranscriptPost({
   const duration = formatDuration(post.durationSeconds);
   const videoUrl = safeHttpUrl(post.videoUrl);
   const language =
-    mode === "translated" ? "简体中文" : post.languageName || post.languageCode;
+    mode === "translated" ? "中文" : post.languageName || post.languageCode;
   const preview = buildTranscriptPreview(post.transcript);
   const detailHref =
     mode === "translated"

@@ -130,7 +130,7 @@ function ChannelRow({
           <p className="channel-management-description">{channel.description}</p>
         ) : null}
         <p className="channel-management-count">
-          {channel.postCount.toLocaleString("zh-CN")} 条字幕
+          {channel.postCount.toLocaleString("zh-CN")} 条中文字幕
         </p>
       </div>
       <div className="channel-management-actions">

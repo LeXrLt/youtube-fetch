@@ -1,7 +1,8 @@
 # Python Pipeline
 
-Python Pipeline 负责发现频道视频、用 `yt-dlp` 获取元数据和字幕、规范化字幕、调用
-Codex 生成结构化翻译与分析，并将全过程写入 PostgreSQL。它只下载字幕，不下载视频
+Python Pipeline 负责发现频道视频、用 `yt-dlp` 获取元数据和字幕、规范化字幕、直接复制
+中文字幕的翻译字段，并调用 Codex 生成非中文翻译与结构化分析，最后将全过程写入
+PostgreSQL。它只下载字幕，不下载视频
 媒体文件。
 
 ## 前置条件
@@ -132,7 +133,9 @@ Codex 负载运行 `analyze --limit N`。两条命令可以同时执行；分析
 继续，不必重新抓取。
 
 命中相同字幕、profile、Schema 版本、提示词版本及相关内容哈希的成功分析时，分析阶段返回
-`skipped`。`--force` 作用于命令包含的阶段：
+`skipped`。但对于旧数据中翻译字段缺失的有效中文字幕，`analyze` 会先原样补齐翻译、源语言
+和复制元数据，再允许该匹配分析返回 `skipped`。该修复不调用 Codex。`--force` 作用于命令
+包含的阶段：
 
 ```bash
 pipeline/.venv/bin/python pipeline/main.py video VIDEO_URL --force
@@ -177,11 +180,12 @@ pipeline/.venv/bin/python pipeline/main.py analyze --limit 20 --force
 一次运行不会重新读取队列，因此本轮失败不会立即反复执行。即使
 `--max-videos-per-channel` 限制了本轮频道发现范围，该频道以前遗留的 `0` 和 `2` 仍会恢复。
 
-每个视频的完整元数据和字幕在下载阶段独立提交；翻译与分析在后续分析阶段独立提交。
+每个视频的完整元数据和字幕在下载阶段独立提交。有效规范化中文字幕的翻译复制包含在保存
+字幕的同一事务中；非中文翻译与分析在后续分析阶段独立提交。
 `subtitle_status` 继续区分 `pending`、`fetched`、`unavailable` 和 `invalid` 等内容状态；确认
 无字幕或字幕无法规范化也属于下载完成，数值状态为 `1`，普通下载不会重复抓取。分析阶段只
-读取每个视频最新且可规范化的字幕，并跳过已有匹配成功 revision 的视频；失败或取消的分析
-可在下一轮恢复。
+读取每个视频最新且可规范化的字幕；它先修复遗留的中文字幕缺失翻译，再跳过已有匹配成功
+revision 的视频。失败或取消的分析可在下一轮恢复。
 
 全局 `--log-level` 默认是 `INFO`。默认日志隐藏 yt-dlp 的网页、播放器 API 等底层请求进度，
 但保留其警告和错误；使用 `--log-level DEBUG` 才会看到这些底层消息和异常堆栈。`INFO` 直接
@@ -200,6 +204,10 @@ pipeline/.venv/bin/python pipeline/main.py analyze --limit 20 --force
 该队列状态由 `011_subtitle_download_status.sql` 添加；Pipeline 业务命令启动时会自动执行
 迁移，独立部署 Web 时需先运行 `./db/migrate.sh`。
 
+`012_backfill_chinese_translations.sql` 为旧库中具有有效规范化文本、语言为 `zh` 或
+`zh-*` 且翻译字段缺失的字幕回填原文、源语言和 `copied_chinese_source` 迁移元数据；已有
+翻译不会被覆盖。
+
 ## 字幕选择与处理
 
 默认语言优先级是简体中文、繁体中文、英文。只有 `pipeline.toml` 明确列出的语言和
@@ -214,8 +222,11 @@ pipeline/.venv/bin/python pipeline/main.py analyze --limit 20 --force
 
 无法找到合格字幕时状态为 `no_subtitle`。字幕已下载但为空、格式不支持或无法解析时，
 原文仍会保存，`normalized_text` 保持空值，状态为 `invalid_subtitle`，不会启动翻译或
-分析。规范化成功后，中文（包括简体和繁体）原样复制到翻译字段，不调用翻译 Agent；
-非中文按配置分块调用 Codex 翻译为简体中文，再执行分析。
+分析。规范化成功后，中文（包括简体和繁体）在 `download` 保存字幕的同一事务中，将
+`normalized_text` 原样复制到 `translated_text`，将源语言写入
+`translated_language_code`，并记录 `mode = copied_chinese_source` 元数据；此过程不等待
+`analyze`，也不调用 Codex。非中文仍在 `analyze` 阶段按配置分块调用 Codex 翻译为简体
+中文，再执行分析。
 
 ## 提示词与结构化输出
 

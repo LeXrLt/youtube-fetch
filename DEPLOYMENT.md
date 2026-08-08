@@ -90,10 +90,14 @@ pipeline/.venv/bin/python pipeline/main.py download
 pipeline/.venv/bin/python pipeline/main.py analyze --limit 20
 ```
 
-下载结果在进入分析前已经提交到 PostgreSQL。分析任务失败、取消或暂时未取得锁时，后续
-`analyze` 可直接从数据库继续，不需要重新访问 YouTube。两个命令可以同时运行；分析启动
+有效规范化的中文（包括简体和繁体）字幕会在 `download` 保存字幕的同一数据库事务中原样
+写入 `translated_text`、源语言和复制元数据，不等待 `analyze`，也不调用 Codex。非中文
+字幕仍由 `analyze` 调用 Codex 翻译。下载结果在进入分析前已经提交到 PostgreSQL。分析
+任务失败、取消或暂时未取得锁时，后续 `analyze` 可直接从数据库继续，不需要重新访问
+YouTube。两个命令可以同时运行；分析启动
 时会固定候选视频集合，新加入的视频留给下一轮；候选视频在执行前若被强制刷新，则读取其
-最新字幕。可分别设置不同的触发频率和超时，避免大量 Codex 任务拖延新字幕抓取。
+最新字幕。`analyze` 会先修复旧数据中缺失翻译的有效中文字幕，再允许匹配的既有成功分析
+返回 `skipped`。可分别设置不同的触发频率和超时，避免大量 Codex 任务拖延新字幕抓取。
 
 启动 Web 服务：
 
@@ -121,6 +125,11 @@ PostgreSQL advisory lock 保证同一数据库最多同时运行一个下载阶�
 `2=下载失败` 的持久化调度状态和错误字段。部署入口必须先运行 `./db/migrate.sh`；Pipeline
 业务命令也会在连接数据库前自动执行迁移。下载失败只影响当前视频，本轮继续处理队列；下一
 次启动时先执行待下载任务，再重试历史失败任务。
+
+升级版本还包含 `012_backfill_chinese_translations.sql`：它为旧库中具有有效
+`normalized_text`、语言为 `zh` 或 `zh-*` 且翻译字段缺失的字幕回填原文、源语言和
+`copied_chinese_source` 迁移元数据，不覆盖已有翻译。应在启用新版 Pipeline 或 Web 前完成
+迁移，使历史中文字幕与新的下载事务保持相同的可展示契约。
 
 频道发现使用 Uploads playlist。新频道会完整回填，或按正数 `max_videos_per_channel` 分批
 回填；完整枚举并成功入队后立即记录 `initial_backfill_completed_at`，不等待字幕成功。此后

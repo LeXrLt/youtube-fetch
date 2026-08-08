@@ -91,20 +91,12 @@ class AnalysisEngine:
         *,
         invocation_sink: InvocationSink | None = None,
     ) -> TranslationResult:
-        if is_chinese_language(source_language):
-            return TranslationResult(
-                translated_text=subtitle_text,
-                translated_language_code=source_language,
-                metadata={
-                    "mode": "copied_chinese_source",
-                    "prompt_version": self._settings.prompts.translation.version,
-                    "translation_schema_sha256": (
-                        self._settings.translation_schema_sha256
-                    ),
-                    "thread_ids": [],
-                    "usage": [],
-                },
-            )
+        copied_translation = self.copy_chinese_source(
+            source_language,
+            subtitle_text,
+        )
+        if copied_translation is not None:
+            return copied_translation
 
         chunks = split_text(subtitle_text, self._settings.agent.translation_chunk_chars)
         translated_chunks: list[str] = []
@@ -151,6 +143,25 @@ class AnalysisEngine:
                 "chunk_count": len(chunks),
                 "thread_ids": thread_ids,
                 "usage": usage,
+            },
+        )
+
+    def copy_chinese_source(
+        self,
+        source_language: str,
+        subtitle_text: str,
+    ) -> TranslationResult | None:
+        if not is_chinese_language(source_language):
+            return None
+        return TranslationResult(
+            translated_text=subtitle_text,
+            translated_language_code=source_language,
+            metadata={
+                "mode": "copied_chinese_source",
+                "prompt_version": self._settings.prompts.translation.version,
+                "translation_schema_sha256": self._settings.translation_schema_sha256,
+                "thread_ids": [],
+                "usage": [],
             },
         )
 

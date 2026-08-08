@@ -82,6 +82,7 @@ def _fetched_video(
     with_subtitle: bool = True,
     normalized_text: str | None = "Original subtitle",
     is_auto_generated: bool = False,
+    language_code: str = "en",
 ) -> FetchedVideo:
     metadata = VideoMetadata(
         youtube_video_id="test-video",
@@ -96,8 +97,8 @@ def _fetched_video(
     subtitle = None
     if with_subtitle:
         subtitle = DownloadedSubtitle(
-            language_code="en",
-            language_name="English",
+            language_code=language_code,
+            language_name="English" if language_code == "en" else "Chinese",
             source_format="vtt",
             is_auto_generated=is_auto_generated,
             raw_text="WEBVTT\n\nOriginal subtitle",
@@ -116,6 +117,23 @@ def _translation() -> TranslationResult:
             "translation_schema_sha256": "translation-schema-digest",
             "thread_ids": ["translation-thread"],
             "usage": [{"input": 12}],
+        },
+    )
+
+
+def _copied_translation(
+    text: str = "中文字幕",
+    language_code: str = "zh-CN",
+) -> TranslationResult:
+    return TranslationResult(
+        translated_text=text,
+        translated_language_code=language_code,
+        metadata={
+            "mode": "copied_chinese_source",
+            "prompt_version": "t1",
+            "translation_schema_sha256": "translation-schema-digest",
+            "thread_ids": [],
+            "usage": [],
         },
     )
 
@@ -480,11 +498,13 @@ class FakeRepository:
         self,
         video: VideoMetadata,
         subtitle: DownloadedSubtitle | None,
+        translation: TranslationResult | None = None,
     ) -> tuple[UUID, UUID | None]:
-        self.calls.append(("save_fetched_video", (video, subtitle), {}))
+        self.calls.append(("save_fetched_video", (video, subtitle, translation), {}))
         self.stored_video = _stored_video(
             FetchedVideo(metadata=video, subtitle=subtitle),
             subtitle_status="fetched" if subtitle is not None else "unavailable",
+            translation=translation,
         )
         self.subtitle_download_errors.pop(video.youtube_video_id, None)
         for index, task in enumerate(self.download_tasks):
@@ -533,8 +553,19 @@ class FakeRepository:
         self.calls.append(("start_analysis_run", args, kwargs))
         return RUN_ID
 
-    async def save_translation(self, *args: Any, **kwargs: Any) -> None:
-        self.calls.append(("save_translation", args, kwargs))
+    async def save_translation(
+        self,
+        subtitle_id: UUID,
+        translation: TranslationResult,
+    ) -> None:
+        self.calls.append(("save_translation", (subtitle_id, translation), {}))
+        if self.stored_video is not None:
+            self.stored_video = replace(
+                self.stored_video,
+                translated_text=translation.translated_text,
+                translated_language_code=translation.translated_language_code,
+                translation_metadata=translation.metadata,
+            )
 
     async def save_agent_invocation(self, *args: Any, **kwargs: Any) -> None:
         self.calls.append(("save_agent_invocation", args, kwargs))
@@ -560,6 +591,18 @@ class FakeAnalysis:
         self.fail_at = fail_at
         self.event_log = event_log
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def copy_chinese_source(
+        self,
+        source_language: str,
+        subtitle_text: str,
+    ) -> TranslationResult | None:
+        if source_language.casefold() != "zh" and not source_language.casefold().startswith(
+            "zh-"
+        ):
+            return None
+        self.calls.append(("copy_chinese_source", (source_language, subtitle_text)))
+        return _copied_translation(subtitle_text, source_language)
 
     async def translate(self, *args: Any, **kwargs: Any) -> TranslationResult:
         self.calls.append(("translate", args))
@@ -607,7 +650,7 @@ async def test_process_video_saves_translation_and_completes_analysis() -> None:
     assert result.youtube_video_id == "test-video"
     source_sha256 = hashlib.sha256(b"Original subtitle").hexdigest()
     assert repository.calls == [
-        ("save_fetched_video", (fetched.metadata, fetched.subtitle), {}),
+        ("save_fetched_video", (fetched.metadata, fetched.subtitle, None), {}),
         (
             "has_matching_analysis",
             (VIDEO_ID, SUBTITLE_ID),
@@ -662,8 +705,11 @@ async def test_process_video_saves_translation_and_completes_analysis() -> None:
 
 
 @pytest.mark.asyncio
-async def test_process_video_skips_when_matching_analysis_exists() -> None:
-    fetched = _fetched_video()
+async def test_process_video_skips_when_matching_analysis_and_translation_exist() -> None:
+    fetched = _fetched_video(
+        normalized_text="中文字幕",
+        language_code="zh-CN",
+    )
     repository = FakeRepository(matching_analysis=True)
     analysis = FakeAnalysis()
 
@@ -675,7 +721,9 @@ async def test_process_video_skips_when_matching_analysis_exists() -> None:
         "save_fetched_video",
         "has_matching_analysis",
     ]
-    assert analysis.calls == []
+    assert analysis.calls == [
+        ("copy_chinese_source", ("zh-CN", "中文字幕")),
+    ]
 
 
 @pytest.mark.asyncio
@@ -689,7 +737,7 @@ async def test_process_video_returns_no_subtitle_without_starting_analysis() -> 
     assert result.status == "no_subtitle"
     assert result.detail == "No preferred original subtitle was available"
     assert repository.calls == [
-        ("save_fetched_video", (fetched.metadata, None), {}),
+        ("save_fetched_video", (fetched.metadata, None, None), {}),
     ]
     assert analysis.calls == []
 
@@ -705,9 +753,72 @@ async def test_process_video_returns_invalid_subtitle_without_starting_analysis(
     assert result.status == "invalid_subtitle"
     assert result.youtube_video_id == "test-video"
     assert repository.calls == [
-        ("save_fetched_video", (fetched.metadata, fetched.subtitle), {}),
+        ("save_fetched_video", (fetched.metadata, fetched.subtitle, None), {}),
     ]
     assert analysis.calls == []
+
+
+@pytest.mark.asyncio
+async def test_download_video_persists_chinese_copy_without_agent() -> None:
+    fetched = _fetched_video(
+        normalized_text="中文字幕",
+        language_code="zh-CN",
+    )
+    repository = FakeRepository()
+    analysis = FakeAnalysis()
+
+    result = await _service(repository, analysis, fetched).download_video(VIDEO_URL)
+
+    assert result.status == "downloaded"
+    copied = _copied_translation()
+    assert repository.calls == [
+        (
+            "save_fetched_video",
+            (fetched.metadata, fetched.subtitle, copied),
+            {},
+        ),
+    ]
+    assert repository.stored_video is not None
+    assert repository.stored_video.translated_text == "中文字幕"
+    assert repository.stored_video.translated_language_code == "zh-CN"
+    assert analysis.calls == [
+        ("copy_chinese_source", ("zh-CN", "中文字幕")),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_matching_chinese_analysis_repairs_missing_copy_before_skip() -> None:
+    fetched = _fetched_video(
+        normalized_text="中文字幕",
+        language_code="zh-CN",
+    )
+    repository = FakeRepository(
+        matching_analysis=True,
+        stored_video=_stored_video(fetched),
+    )
+    analysis = FakeAnalysis()
+    service = PipelineService(
+        _settings(),  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        FakeYoutube(fetched),  # type: ignore[arg-type]
+        analysis,  # type: ignore[arg-type]
+    )
+
+    result = await service.analyze_video("test-video")
+
+    assert result.status == "skipped"
+    copied = _copied_translation()
+    assert [call[0] for call in repository.calls] == [
+        "get_stored_video",
+        "save_translation",
+        "has_matching_analysis",
+    ]
+    assert ("save_translation", (SUBTITLE_ID, copied), {}) in repository.calls
+    assert repository.stored_video is not None
+    assert repository.stored_video.translated_text == "中文字幕"
+    assert analysis.calls == [
+        ("copy_chinese_source", ("zh-CN", "中文字幕")),
+    ]
 
 
 @pytest.mark.asyncio

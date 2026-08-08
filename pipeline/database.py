@@ -465,7 +465,11 @@ class PipelineRepository:
         self,
         video: VideoMetadata,
         subtitle: DownloadedSubtitle | None,
+        translation: TranslationResult | None = None,
     ) -> tuple[UUID, UUID | None]:
+        if subtitle is None and translation is not None:
+            raise ValueError("translation requires a subtitle")
+
         pool = self._require_pool()
         async with pool.acquire() as connection, connection.transaction():
             channel_id = await self._upsert_channel(
@@ -545,9 +549,12 @@ class PipelineRepository:
                     source_format,
                     is_auto_generated,
                     raw_text,
-                    normalized_text
+                    normalized_text,
+                    translated_text,
+                    translated_language_code,
+                    translation_metadata
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
                 ON CONFLICT (
                     video_id,
                     language_code,
@@ -559,6 +566,20 @@ class PipelineRepository:
                         subtitle_tracks.normalized_text,
                         EXCLUDED.normalized_text
                     ),
+                    translated_text = COALESCE(
+                        subtitle_tracks.translated_text,
+                        EXCLUDED.translated_text
+                    ),
+                    translated_language_code = COALESCE(
+                        subtitle_tracks.translated_language_code,
+                        EXCLUDED.translated_language_code
+                    ),
+                    translation_metadata = CASE
+                        WHEN subtitle_tracks.translated_text IS NULL
+                             AND EXCLUDED.translated_text IS NOT NULL
+                        THEN EXCLUDED.translation_metadata
+                        ELSE subtitle_tracks.translation_metadata
+                    END,
                     fetched_at = now(),
                     updated_at = now()
                 RETURNING id
@@ -570,6 +591,13 @@ class PipelineRepository:
                 subtitle.is_auto_generated,
                 subtitle.raw_text,
                 subtitle.normalized_text,
+                translation.translated_text if translation is not None else None,
+                (
+                    translation.translated_language_code
+                    if translation is not None
+                    else None
+                ),
+                _json(translation.metadata if translation is not None else {}),
             )
             return video_id, subtitle_id
 
@@ -590,7 +618,10 @@ class PipelineRepository:
             SELECT video.youtube_video_id, video.video_url
             FROM videos AS video
             JOIN LATERAL (
-                SELECT subtitle.id, subtitle.normalized_text
+                SELECT subtitle.id,
+                       subtitle.normalized_text,
+                       subtitle.translated_text,
+                       subtitle.translated_language_code
                 FROM subtitle_tracks AS subtitle
                 WHERE subtitle.video_id = video.id
                 ORDER BY subtitle.fetched_at DESC,
@@ -619,6 +650,8 @@ class PipelineRepository:
                             digest(latest_subtitle.normalized_text, 'sha256'),
                             'hex'
                         )
+                        AND latest_subtitle.translated_text IS NOT NULL
+                        AND latest_subtitle.translated_language_code IS NOT NULL
                   )
               )
             ORDER BY video.created_at ASC, video.id ASC
@@ -661,6 +694,8 @@ class PipelineRepository:
                     SELECT 1
                     FROM video_analyses AS analysis
                     JOIN analysis_runs AS run ON run.id = analysis.analysis_run_id
+                    JOIN subtitle_tracks AS subtitle
+                      ON subtitle.id = analysis.subtitle_track_id
                     WHERE analysis.video_id = $1
                       AND analysis.subtitle_track_id = $2
                       AND analysis.profile_name = $3
@@ -671,6 +706,8 @@ class PipelineRepository:
                       AND run.metadata ->> 'translation_schema_sha256' = $7
                       AND run.metadata ->> 'schema_sha256' = $8
                       AND run.metadata ->> 'source_sha256' = $9
+                      AND subtitle.translated_text IS NOT NULL
+                      AND subtitle.translated_language_code IS NOT NULL
                 )
                 """,
                 video_id,

@@ -444,6 +444,7 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
     async def save_video(
         youtube_video_id: str,
         normalized_text: str | None,
+        translation: TranslationResult | None = None,
     ) -> tuple[UUID, UUID]:
         video_url = f"https://www.youtube.com/watch?v={youtube_video_id}"
         video = VideoMetadata(
@@ -460,12 +461,28 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
             raw_text=f"WEBVTT\n\n{youtube_video_id}:{normalized_text}",
             normalized_text=normalized_text,
         )
-        video_id, subtitle_id = await repository.save_fetched_video(video, subtitle)
+        video_id, subtitle_id = await repository.save_fetched_video(
+            video,
+            subtitle,
+            translation,
+        )
         assert subtitle_id is not None
         return video_id, subtitle_id
 
     pending_ids = await save_video("candidate-pending", "待分析字幕")
-    matched_ids = await save_video("candidate-matched", "Already analyzed")
+    matched_ids = await save_video(
+        "candidate-matched",
+        "Already analyzed",
+        TranslationResult(
+            translated_text="已分析",
+            translated_language_code="zh-Hans",
+            metadata={"mode": "test"},
+        ),
+    )
+    recoverable_ids = await save_video(
+        "candidate-missing-translation",
+        "Analysis succeeded before translation was persisted",
+    )
     failed_ids = await save_video("candidate-failed", "Failed analysis")
     running_ids = await save_video("candidate-running", "Running analysis")
     cancelled_ids = await save_video("candidate-cancelled", "Cancelled analysis")
@@ -540,14 +557,22 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
             )
 
     await add_analysis(matched_ids, "succeeded")
+    await add_analysis(recoverable_ids, "succeeded")
     await add_analysis(failed_ids, "failed")
     await add_analysis(running_ids, "running")
     await add_analysis(cancelled_ids, "cancelled")
 
-    sortable_candidates = [pending_ids, failed_ids, running_ids, cancelled_ids]
+    sortable_candidates = [
+        pending_ids,
+        recoverable_ids,
+        failed_ids,
+        running_ids,
+        cancelled_ids,
+    ]
     all_video_ids = [
         pending_ids[0],
         matched_ids[0],
+        recoverable_ids[0],
         failed_ids[0],
         running_ids[0],
         cancelled_ids[0],
@@ -568,7 +593,13 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
                 (video_id, f"candidate-{state}")
                 for (video_id, _), state in zip(
                     sortable_candidates,
-                    ("pending", "failed", "running", "cancelled"),
+                    (
+                        "pending",
+                        "missing-translation",
+                        "failed",
+                        "running",
+                        "cancelled",
+                    ),
                     strict=True,
                 )
             ),
@@ -582,6 +613,8 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
         limit=None,
     )
     assert [candidate.youtube_video_id for candidate in candidates] == expected_ids
+    assert "candidate-missing-translation" in expected_ids
+    assert "candidate-matched" not in expected_ids
     assert candidates == [
         VideoReference(
             youtube_video_id=youtube_video_id,
@@ -649,6 +682,116 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
     assert "candidate-invalid" not in {
         candidate.youtube_video_id for candidate in forced_candidates
     }
+
+
+@pytest.mark.asyncio
+async def test_save_fetched_video_only_fills_missing_translation(
+    repository: PipelineRepository,
+) -> None:
+    video = VideoMetadata(
+        youtube_video_id="atomic-translation-video",
+        channel=ChannelMetadata(
+            youtube_channel_id="atomic-translation-channel",
+            title="Atomic Translation Channel",
+            channel_url="https://www.youtube.com/@atomic-translation-channel",
+        ),
+        title="Atomic Translation Video",
+        video_url="https://www.youtube.com/watch?v=atomic-translation-video",
+    )
+    subtitle = DownloadedSubtitle(
+        language_code="zh-Hant",
+        language_name="Chinese (Traditional)",
+        source_format="vtt",
+        is_auto_generated=False,
+        raw_text="WEBVTT\n\n中文字幕原文",
+        normalized_text="中文字幕原文",
+    )
+    first_translation = TranslationResult(
+        translated_text=subtitle.normalized_text,
+        translated_language_code=subtitle.language_code,
+        metadata={"mode": "copied_chinese_source", "sequence": 1},
+    )
+    replacement_translation = TranslationResult(
+        translated_text="不应覆盖的翻译",
+        translated_language_code="zh-Hant",
+        metadata={"mode": "replacement", "sequence": 2},
+    )
+
+    video_id, translated_subtitle_id = await repository.save_fetched_video(
+        video,
+        subtitle,
+        first_translation,
+    )
+    assert translated_subtitle_id is not None
+    assert await repository.save_fetched_video(
+        video,
+        subtitle,
+        None,
+    ) == (video_id, translated_subtitle_id)
+    assert await repository.save_fetched_video(
+        video,
+        subtitle,
+        replacement_translation,
+    ) == (video_id, translated_subtitle_id)
+
+    pool = repository._require_pool()
+    persisted_first = await pool.fetchrow(
+        """
+        SELECT translated_text, translated_language_code,
+               translation_metadata::text AS translation_metadata
+        FROM subtitle_tracks
+        WHERE id = $1
+        """,
+        translated_subtitle_id,
+    )
+    assert persisted_first is not None
+    assert persisted_first["translated_text"] == first_translation.translated_text
+    assert persisted_first["translated_language_code"] == subtitle.language_code
+    assert json.loads(persisted_first["translation_metadata"]) == (
+        first_translation.metadata
+    )
+
+    await pool.execute(
+        """
+        UPDATE subtitle_tracks
+        SET translated_text = NULL,
+            translated_language_code = NULL,
+            translation_metadata = '{}'::jsonb
+        WHERE id = $1
+        """,
+        translated_subtitle_id,
+    )
+    assert await repository.save_fetched_video(
+        video,
+        subtitle,
+        first_translation,
+    ) == (video_id, translated_subtitle_id)
+    persisted_fill = await pool.fetchrow(
+        """
+        SELECT translated_text, translated_language_code,
+               translation_metadata::text AS translation_metadata
+        FROM subtitle_tracks
+        WHERE id = $1
+        """,
+        translated_subtitle_id,
+    )
+    assert persisted_fill is not None
+    assert persisted_fill["translated_text"] == first_translation.translated_text
+    assert persisted_fill["translated_language_code"] == subtitle.language_code
+    assert json.loads(persisted_fill["translation_metadata"]) == first_translation.metadata
+
+    missing_video = replace(
+        video,
+        youtube_video_id="translation-without-subtitle",
+        video_url="https://www.youtube.com/watch?v=translation-without-subtitle",
+    )
+    with pytest.raises(ValueError, match="requires a subtitle"):
+        await repository.save_fetched_video(
+            missing_video,
+            None,
+            first_translation,
+        )
+    assert await repository.get_stored_video(missing_video.youtube_video_id) is None
 
 
 @pytest.mark.asyncio
@@ -940,6 +1083,43 @@ async def test_repository_persists_pipeline_artifacts_and_run_states(
         schema_version="2026-08-04",
         prompt_version="translation:t1;analysis:a1",
         prompt_sha256="different-prompt-sha",
+        translation_schema_sha256="translation-schema-sha",
+        schema_sha256="schema-sha",
+        source_sha256="source-sha",
+    )
+
+    await pool.execute(
+        """
+        UPDATE subtitle_tracks
+        SET translated_text = NULL,
+            translated_language_code = NULL,
+            translation_metadata = '{}'::jsonb
+        WHERE id = $1
+        """,
+        subtitle_id,
+    )
+    assert not await repository.has_matching_analysis(
+        video_id,
+        subtitle_id,
+        profile_name="research-v1",
+        schema_version="2026-08-04",
+        prompt_version="translation:t1;analysis:a1",
+        prompt_sha256="prompt-sha",
+        translation_schema_sha256="translation-schema-sha",
+        schema_sha256="schema-sha",
+        source_sha256="source-sha",
+    )
+    assert await repository.save_fetched_video(video, subtitle, translation) == (
+        video_id,
+        subtitle_id,
+    )
+    assert await repository.has_matching_analysis(
+        video_id,
+        subtitle_id,
+        profile_name="research-v1",
+        schema_version="2026-08-04",
+        prompt_version="translation:t1;analysis:a1",
+        prompt_sha256="prompt-sha",
         translation_schema_sha256="translation-schema-sha",
         schema_sha256="schema-sha",
         source_sha256="source-sha",

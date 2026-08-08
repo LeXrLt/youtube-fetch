@@ -238,7 +238,120 @@ VALUES (
   'en',
   'Migration test subtitle'
 );
+
+INSERT INTO subtitle_tracks(
+  id,
+  video_id,
+  language_code,
+  raw_text,
+  normalized_text,
+  translated_text,
+  translated_language_code,
+  translation_metadata
+)
+VALUES
+  (
+    '00000000-0000-0000-0000-000000000006',
+    '00000000-0000-0000-0000-000000000004',
+    'zh-Hant',
+    'Backfill raw source',
+    'Backfill normalized source',
+    NULL,
+    NULL,
+    '{"legacy": true, "mode": "legacy"}'::jsonb
+  ),
+  (
+    '00000000-0000-0000-0000-000000000007',
+    '00000000-0000-0000-0000-000000000004',
+    'ZH-CN',
+    'Uppercase language raw source',
+    'Uppercase language normalized source',
+    NULL,
+    NULL,
+    '{}'::jsonb
+  ),
+  (
+    '00000000-0000-0000-0000-000000000008',
+    '00000000-0000-0000-0000-000000000004',
+    'en',
+    'English raw source',
+    'English normalized source',
+    NULL,
+    NULL,
+    '{}'::jsonb
+  ),
+  (
+    '00000000-0000-0000-0000-000000000009',
+    '00000000-0000-0000-0000-000000000004',
+    'zh',
+    'Missing normalized source',
+    NULL,
+    NULL,
+    NULL,
+    '{}'::jsonb
+  ),
+  (
+    '00000000-0000-0000-0000-000000000010',
+    '00000000-0000-0000-0000-000000000004',
+    'zh-Hans',
+    'Existing translation raw source',
+    'Existing translation normalized source',
+    'Existing translated text',
+    'zh-Hans',
+    '{"mode": "existing", "keep": true}'::jsonb
+  ),
+  (
+    '00000000-0000-0000-0000-000000000011',
+    '00000000-0000-0000-0000-000000000004',
+    'zh-TW',
+    'Blank normalized source',
+    '   ',
+    NULL,
+    NULL,
+    '{}'::jsonb
+  );
 SQL
+
+"${PSQL_TEST[@]}" \
+  --file "$ROOT_DIR/db/migrations/012_backfill_chinese_translations.sql" \
+  >/dev/null
+
+translation_backfill_valid="$(
+  "${PSQL_TEST[@]}" --tuples-only --no-align --command \
+    "SELECT (
+      (SELECT translated_text = 'Backfill normalized source'
+              AND translated_language_code = 'zh-Hant'
+              AND translation_metadata ->> 'mode' = 'copied_chinese_source'
+              AND translation_metadata ->> 'migration' = '012_backfill_chinese_translations'
+              AND translation_metadata ->> 'legacy' = 'true'
+       FROM subtitle_tracks
+       WHERE id = '00000000-0000-0000-0000-000000000006')
+      AND
+      (SELECT translated_text = 'Uppercase language normalized source'
+              AND translated_language_code = 'ZH-CN'
+       FROM subtitle_tracks
+       WHERE id = '00000000-0000-0000-0000-000000000007')
+      AND
+      (SELECT translated_text IS NULL AND translated_language_code IS NULL
+       FROM subtitle_tracks
+       WHERE id = '00000000-0000-0000-0000-000000000008')
+      AND
+      (SELECT translated_text IS NULL AND translated_language_code IS NULL
+       FROM subtitle_tracks
+       WHERE id = '00000000-0000-0000-0000-000000000009')
+      AND
+      (SELECT translated_text = 'Existing translated text'
+              AND translated_language_code = 'zh-Hans'
+              AND translation_metadata = '{\"mode\": \"existing\", \"keep\": true}'::jsonb
+       FROM subtitle_tracks
+       WHERE id = '00000000-0000-0000-0000-000000000010')
+      AND
+      (SELECT translated_text IS NULL AND translated_language_code IS NULL
+       FROM subtitle_tracks
+       WHERE id = '00000000-0000-0000-0000-000000000011')
+    )::integer;"
+)"
+[ "$translation_backfill_valid" = "1" ]
 
 if "${PSQL_TEST[@]}" >/dev/null 2>&1 <<'SQL'
 INSERT INTO video_analyses(video_id, subtitle_track_id)

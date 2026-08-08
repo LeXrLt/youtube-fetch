@@ -154,11 +154,15 @@ class PipelineService:
             or stored.subtitle_download_status is not SubtitleDownloadStatus.DOWNLOADED
         ):
             fetched = await self._youtube.fetch_video(video_url)
+            stored_translation = _copied_chinese_translation(
+                self._analysis,
+                fetched,
+            )
             video_id, subtitle_id = await self._repository.save_fetched_video(
                 fetched.metadata,
                 fetched.subtitle,
+                stored_translation,
             )
-            stored_translation = None
             downloaded = True
         else:
             fetched = stored.fetched
@@ -199,6 +203,17 @@ class PipelineService:
                 status="invalid_subtitle",
                 detail="The original subtitle was saved but could not be normalized",
             )
+
+        if stored_translation is None:
+            stored_translation = self._analysis.copy_chinese_source(
+                fetched.subtitle.language_code,
+                fetched.subtitle.normalized_text,
+            )
+            if stored_translation is not None:
+                await self._repository.save_translation(
+                    subtitle_id,
+                    stored_translation,
+                )
 
         source_sha256 = hashlib.sha256(
             fetched.subtitle.normalized_text.encode("utf-8")
@@ -652,6 +667,19 @@ def _stored_translation(
         translated_text=stored.translated_text,
         translated_language_code=stored.translated_language_code,
         metadata=metadata,
+    )
+
+
+def _copied_chinese_translation(
+    analysis: AnalysisEngine,
+    fetched: FetchedVideo,
+) -> TranslationResult | None:
+    subtitle = fetched.subtitle
+    if subtitle is None or subtitle.normalized_text is None:
+        return None
+    return analysis.copy_chinese_source(
+        subtitle.language_code,
+        subtitle.normalized_text,
     )
 
 

@@ -7,6 +7,7 @@ max_pool_size = 5
 command_timeout_seconds = 30
 
 [youtube]
+cookie_source = "auto"
 cookie_file = "config/youtube.cookies.txt"
 subscription_feed_url = "https://www.youtube.com/feed/channels"
 max_videos_per_channel = 0

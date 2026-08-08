@@ -48,16 +48,27 @@ POSTGRES_DB=youtube_fetch
 可执行文件路径，`CODEX_MODEL` 覆盖配置中的模型；通常保持为空以使用已认证 CLI 的
 默认设置。
 
-将登录 YouTube 后导出的 Netscape Cookie 文件放在
+Cookie 来源默认是 `auto`：macOS 使用当前用户的 Chrome 登录态，其他平台使用 Netscape
+Cookie 文件。macOS 不需要导出 Cookie，但 Pipeline 必须由登录 Chrome 的同一用户运行，
+登录 Keychain 必须已解锁并允许访问 Chrome Safe Storage。未指定 profile 时，`yt-dlp`
+选择最近使用的 Chrome profile；多 profile 环境可在根目录 `.env` 中设置：
+
+```dotenv
+YOUTUBE_CHROME_PROFILE=Profile 1
+```
+
+非 macOS 平台将导出的 Netscape Cookie 放在
 `pipeline/config/youtube.cookies.txt`，并限制为当前用户可读写：
 
 ```bash
 chmod 600 pipeline/config/youtube.cookies.txt
 ```
 
-该文件已被 Git 忽略，配置加载时会校验文件存在且权限不向组用户或其他用户开放。
-部署环境可用 `YOUTUBE_COOKIE_FILE` 指向其他私有路径。不得把 Cookie 内容写入日志、
-测试输出或文档。
+该文件已被 Git 忽略。文件来源下，配置加载时会校验文件存在且权限不向组用户或其他用户
+开放。`YOUTUBE_COOKIE_SOURCE=auto|chrome|file` 可覆盖策略，
+`YOUTUBE_COOKIE_FILE` 可指定其他私有路径；为兼容旧部署，只设置
+`YOUTUBE_COOKIE_FILE` 会自动选择文件来源。Chrome 与文件来源互斥，不会将浏览器 Cookie
+写入文件。不得把 Cookie 内容写入日志、测试输出或文档。
 
 Pipeline 会读取 `$CODEX_HOME/config.toml` 中已配置的 MCP server 名称，并在每次 Agent
 调用中显式禁用它们。名称只能包含字母、数字、下划线和连字符；无法安全生成禁用覆盖

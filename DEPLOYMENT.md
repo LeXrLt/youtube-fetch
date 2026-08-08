@@ -38,11 +38,26 @@ WEB_ROUTE_KEY=<生成的 32 位密钥>
 权限。生产环境也可以直接通过环境变量向 Web 构建和运行进程提供 `DATABASE_URL` 与
 `WEB_ROUTE_KEY`；不得提交真实凭据或密钥。构建和运行必须使用同一个 `WEB_ROUTE_KEY`。
 
-将 YouTube Cookie 写入 `pipeline/config/youtube.cookies.txt`，并限制文件权限：
+`pipeline/config/pipeline.toml` 默认设置 `cookie_source = "auto"`。在 macOS 上，Pipeline
+优先使用当前用户已登录 YouTube 的 Chrome Cookie，不要求导出文件。Pipeline 必须由该
+Chrome 用户运行，登录 Keychain 需要保持解锁，并在系统询问时授权访问 Chrome Safe
+Storage。多个 Chrome profile 时可在根目录 `.env` 中指定：
+
+```dotenv
+YOUTUBE_CHROME_PROFILE=Profile 1
+```
+
+非 macOS 平台的 `auto` 使用 Netscape Cookie 文件。也可以在任意平台显式切换到文件来源：
 
 ```bash
+export YOUTUBE_COOKIE_SOURCE=file
 chmod 600 pipeline/config/youtube.cookies.txt
 ```
+
+`YOUTUBE_COOKIE_SOURCE=chrome` 可强制读取 Chrome；只设置旧的 `YOUTUBE_COOKIE_FILE`
+仍会自动选择文件来源。两种来源不会同时传给 `yt-dlp`。`config-check` 只校验配置，不访问
+Chrome 或 Keychain；macOS 部署后应运行一次 `channel-inspect` 或小批量 `download` 验证
+系统授权和目标 profile。
 
 `pipeline/config/pipeline.toml` 中的下载并发默认为：
 

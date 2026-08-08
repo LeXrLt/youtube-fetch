@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from string import Template
 from typing import Literal
@@ -51,7 +52,9 @@ class PipelineSettings(BaseModel):
 class YoutubeSettings(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    cookie_file: Path
+    cookie_source: Literal["file", "chrome"]
+    cookie_file: Path | None = None
+    chrome_profile: str | None = None
     subscription_feed_url: str = "https://www.youtube.com/feed/channels"
     max_videos_per_channel: int = Field(default=0, ge=0)
     socket_timeout_seconds: float = Field(default=30, gt=0)
@@ -61,7 +64,11 @@ class YoutubeSettings(BaseModel):
     language_priority: list[list[str]]
 
     @model_validator(mode="after")
-    def validate_priorities(self) -> YoutubeSettings:
+    def validate_youtube_settings(self) -> YoutubeSettings:
+        if self.cookie_source == "file" and self.cookie_file is None:
+            raise ValueError("cookie_file is required when cookie_source is file")
+        if self.chrome_profile is not None and not self.chrome_profile.strip():
+            raise ValueError("chrome_profile must be non-empty when configured")
         languages = [language.casefold() for group in self.language_priority for language in group]
         if not languages or len(languages) != len(set(languages)):
             raise ValueError("language_priority must contain unique language codes")
@@ -190,14 +197,35 @@ def _load_settings(config_path: Path, env_path: Path) -> RuntimeSettings:
         **database_data,
     )
     youtube_data = dict(config_data.get("youtube", {}))
-    if environment.get("YOUTUBE_COOKIE_FILE"):
-        youtube_data["cookie_file"] = environment["YOUTUBE_COOKIE_FILE"]
-    youtube_data["cookie_file"] = _resolve_path(PIPELINE_ROOT, youtube_data["cookie_file"])
+    cookie_file_override = environment.get("YOUTUBE_COOKIE_FILE")
+    cookie_source_override = environment.get("YOUTUBE_COOKIE_SOURCE")
+    if cookie_file_override:
+        youtube_data["cookie_file"] = cookie_file_override
+    if cookie_source_override:
+        youtube_data["cookie_source"] = cookie_source_override
+    elif cookie_file_override:
+        # Preserve the legacy meaning of an explicit cookie-file override.
+        youtube_data["cookie_source"] = "file"
+    if environment.get("YOUTUBE_CHROME_PROFILE"):
+        youtube_data["chrome_profile"] = environment["YOUTUBE_CHROME_PROFILE"]
+
+    configured_cookie_source = str(youtube_data.get("cookie_source", "auto")).strip().lower()
+    if configured_cookie_source == "auto":
+        configured_cookie_source = "chrome" if sys.platform == "darwin" else "file"
+    youtube_data["cookie_source"] = configured_cookie_source
+    if youtube_data.get("cookie_file"):
+        youtube_data["cookie_file"] = _resolve_path(
+            PIPELINE_ROOT,
+            youtube_data["cookie_file"],
+        )
     youtube = YoutubeSettings.model_validate(youtube_data)
-    if not youtube.cookie_file.is_file():
-        raise ValueError(f"YouTube cookie file does not exist: {youtube.cookie_file}")
-    if youtube.cookie_file.stat().st_mode & 0o077:
-        raise ValueError("YouTube cookie file must not be accessible by group or other users")
+    if youtube.cookie_source == "file":
+        if youtube.cookie_file is None or not youtube.cookie_file.is_file():
+            raise ValueError(f"YouTube cookie file does not exist: {youtube.cookie_file}")
+        if youtube.cookie_file.stat().st_mode & 0o077:
+            raise ValueError(
+                "YouTube cookie file must not be accessible by group or other users"
+            )
     agent_data = dict(config_data.get("agent", {}))
     if environment.get("CODEX_MODEL"):
         agent_data["model"] = environment["CODEX_MODEL"]

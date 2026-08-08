@@ -92,10 +92,16 @@ WEB_ROUTE_KEY=<生成的 32 位密钥>
 页面通过 `/<密钥>` 访问，根路径返回 404。生产环境也可以直接向 Web 进程提供这两个变量，
 进程环境变量优先于 `.env.local`；构建和运行必须使用相同的 `WEB_ROUTE_KEY`。
 
-YouTube 登录状态使用 Netscape 格式 Cookie 文件，默认路径为
-`pipeline/config/youtube.cookies.txt`，可通过 `YOUTUBE_COOKIE_FILE` 覆盖。该文件已被
-Git 忽略，必须由当前用户私有（权限 `0600`）；配置加载时会拒绝组用户或其他用户可读
-的文件。任何日志、文档和测试输出都不得记录 Cookie 内容。
+YouTube Cookie 来源由 `[youtube].cookie_source` 控制，默认 `auto`：macOS 直接读取当前
+用户的 Chrome Cookie，其他平台读取 `pipeline/config/youtube.cookies.txt`。macOS 使用
+Chrome 时，运行 Pipeline 的系统用户必须与登录 Chrome 的用户相同，并允许进程访问已解锁
+的登录 Keychain；未指定 profile 时由 `yt-dlp` 选择最近使用的 Chrome profile。
+
+`YOUTUBE_COOKIE_SOURCE=chrome|file|auto` 可覆盖来源，`YOUTUBE_CHROME_PROFILE` 可固定
+`Default`、`Profile 1` 等 profile。为了兼容原配置，仅显式设置
+`YOUTUBE_COOKIE_FILE` 时会自动选择 `file`；Cookie 文件必须为 Netscape 格式、权限
+`0600`。Chrome 和文件来源互斥，不会合并或把浏览器 Cookie 导出到文件。任何日志、文档
+和测试输出都不得记录 Cookie 内容。
 
 运行迁移需要本机提供 `psql`、`createdb` 和 `sha256sum`；运行集成测试还需要
 `dropdb`。数据库用户须能连接 `postgres` 数据库、创建 `youtube_fetch`，并能在

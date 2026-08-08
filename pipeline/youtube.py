@@ -221,14 +221,27 @@ class YoutubeClient:
         return channel
 
     def _base_options(self) -> dict[str, object]:
-        return {
+        options: dict[str, object] = {
             "quiet": True,
             "no_warnings": False,
             "logger": _YtDlpLogger(),
             "socket_timeout": self._settings.socket_timeout_seconds,
             "skip_download": True,
-            "cookiefile": str(self._settings.cookie_file),
         }
+        # Keep browser and file sources mutually exclusive; yt-dlp may persist
+        # browser cookies when both options target the same cookie jar.
+        if self._settings.cookie_source == "chrome":
+            profile = self._settings.chrome_profile
+            options["cookiesfrombrowser"] = (
+                ("chrome", profile, None, None) if profile else ("chrome",)
+            )
+            LOGGER.debug("yt-dlp cookie source: Chrome browser")
+        else:
+            if self._settings.cookie_file is None:
+                raise YoutubeMetadataError("YouTube cookie file is not configured")
+            options["cookiefile"] = str(self._settings.cookie_file)
+            LOGGER.debug("yt-dlp cookie source: Netscape cookie file")
+        return options
 
     def _fetch_video_sync(self, video_url: str) -> FetchedVideo:
         options = {**self._base_options(), "noplaylist": True}

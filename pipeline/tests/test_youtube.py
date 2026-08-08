@@ -46,9 +46,16 @@ class FakeYoutubeDL:
         return type(self).payload
 
 
-def _settings(cookie_file: Path) -> SimpleNamespace:
+def _settings(
+    cookie_file: Path | None,
+    *,
+    cookie_source: str = "file",
+    chrome_profile: str | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
+        cookie_source=cookie_source,
         cookie_file=cookie_file,
+        chrome_profile=chrome_profile,
         subscription_feed_url="https://www.youtube.com/feed/channels",
         socket_timeout_seconds=30,
         allow_automatic_captions=True,
@@ -170,7 +177,40 @@ async def test_discovers_authenticated_subscriptions_with_cookie_file(
     assert download is False
     assert process is True
     assert options["cookiefile"] == str(cookie_file)
+    assert "cookiesfrombrowser" not in options
     assert options["extract_flat"] == "in_playlist"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "expected_specification"),
+    [
+        (None, ("chrome",)),
+        ("Profile 2", ("chrome", "Profile 2", None, None)),
+    ],
+)
+async def test_uses_chrome_browser_cookies_without_cookie_file(
+    profile: str | None,
+    expected_specification: tuple[object, ...],
+) -> None:
+    FakeYoutubeDL.payload = {
+        "channel_id": CHANNEL_ID,
+        "channel": "Channel One",
+        "channel_url": "https://www.youtube.com/@channel-one",
+        "uploader_id": "@channel-one",
+    }
+
+    await YoutubeClient(
+        _settings(
+            None,
+            cookie_source="chrome",
+            chrome_profile=profile,
+        )
+    ).inspect_channel("@channel-one")
+
+    options, _, _, _ = FakeYoutubeDL.calls[0]
+    assert options["cookiesfrombrowser"] == expected_specification
+    assert "cookiefile" not in options
 
 
 @pytest.mark.asyncio

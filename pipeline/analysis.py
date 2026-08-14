@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
@@ -19,6 +20,8 @@ from models import (
     VideoMetadata,
 )
 from subtitles import is_simplified_chinese_language
+
+LOGGER = logging.getLogger(__name__)
 
 
 class AnalysisInputError(ValueError):
@@ -176,6 +179,12 @@ class AnalysisEngine:
         invocation_sink: InvocationSink | None = None,
     ) -> AnalysisOutcome:
         if len(translated_text) > self._settings.agent.analysis_input_max_chars:
+            LOGGER.warning(
+                "analysis: translated subtitle exceeds input limit "
+                "(length=%d, limit=%d)",
+                len(translated_text),
+                self._settings.agent.analysis_input_max_chars,
+            )
             raise AnalysisInputError(
                 "Translated subtitle exceeds analysis_input_max_chars; "
                 "increase the configured limit or add a map-reduce profile"

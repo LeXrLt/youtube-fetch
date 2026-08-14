@@ -21,6 +21,7 @@ from models import (
     DownloadedSubtitle,
     FetchedVideo,
     ProcessResult,
+    PublicationStepInput,
     StoredVideo,
     SubtitleDownloadStatus,
     SubtitleDownloadTask,
@@ -33,6 +34,7 @@ from service import PipelineService
 VIDEO_ID = uuid4()
 SUBTITLE_ID = uuid4()
 RUN_ID = uuid4()
+ANALYSIS_ID = uuid4()
 CHANNEL_ID = uuid4()
 VIDEO_URL = "https://www.youtube.com/watch?v=test-video"
 CHANNEL_URL = "https://www.youtube.com/@test-channel"
@@ -279,6 +281,7 @@ class FakeRepository:
         self,
         *,
         matching_analysis: bool = False,
+        pending_publication: bool = False,
         stored_video: StoredVideo | None = None,
         channels: list[ChannelRecord] | None = None,
         analysis_candidates: list[VideoReference] | None = None,
@@ -286,6 +289,7 @@ class FakeRepository:
         known_video_ids_by_channel: dict[UUID, set[str]] | None = None,
     ) -> None:
         self.matching_analysis = matching_analysis
+        self.pending_publication = pending_publication
         self.stored_video = stored_video
         self.channels = channels or []
         self.analysis_candidates = analysis_candidates or []
@@ -302,6 +306,20 @@ class FakeRepository:
         ):
             return self.stored_video
         return None
+
+    async def get_pending_publication_analysis_id(
+        self,
+        video_id: UUID,
+        target_key: str,
+    ) -> UUID | None:
+        self.calls.append(
+            (
+                "get_pending_publication_analysis_id",
+                (video_id, target_key),
+                {},
+            )
+        )
+        return ANALYSIS_ID if self.pending_publication else None
 
     async def register_channel(
         self,
@@ -549,6 +567,40 @@ class FakeRepository:
         )
         return self.matching_analysis
 
+    async def get_matching_analysis_id(
+        self,
+        video_id: UUID,
+        subtitle_track_id: UUID,
+        *,
+        profile_name: str,
+        schema_version: str,
+        prompt_version: str,
+        prompt_sha256: str,
+        translation_schema_sha256: str,
+        schema_sha256: str,
+        source_sha256: str,
+        publication_target_key: str | None = None,
+    ) -> UUID | None:
+        options = {
+            "profile_name": profile_name,
+            "schema_version": schema_version,
+            "prompt_version": prompt_version,
+            "prompt_sha256": prompt_sha256,
+            "translation_schema_sha256": translation_schema_sha256,
+            "schema_sha256": schema_sha256,
+            "source_sha256": source_sha256,
+        }
+        if publication_target_key is not None:
+            options["publication_target_key"] = publication_target_key
+        self.calls.append(
+            (
+                "get_matching_analysis_id",
+                (video_id, subtitle_track_id),
+                options,
+            )
+        )
+        return ANALYSIS_ID if self.matching_analysis else None
+
     async def start_analysis_run(self, *args: Any, **kwargs: Any) -> UUID:
         self.calls.append(("start_analysis_run", args, kwargs))
         return RUN_ID
@@ -572,7 +624,7 @@ class FakeRepository:
 
     async def complete_analysis_run(self, *args: Any, **kwargs: Any) -> UUID:
         self.calls.append(("complete_analysis_run", args, kwargs))
-        return uuid4()
+        return ANALYSIS_ID
 
     async def fail_analysis_run(self, *args: Any, **kwargs: Any) -> None:
         self.calls.append(("fail_analysis_run", args, kwargs))
@@ -597,9 +649,8 @@ class FakeAnalysis:
         source_language: str,
         subtitle_text: str,
     ) -> TranslationResult | None:
-        if source_language.casefold() != "zh" and not source_language.casefold().startswith(
-            "zh-"
-        ):
+        normalized_language = source_language.strip().replace("_", "-").casefold()
+        if normalized_language not in {"zh", "zh-hans", "zh-cn", "zh-sg"}:
             return None
         self.calls.append(("copy_chinese_source", (source_language, subtitle_text)))
         return _copied_translation(subtitle_text, source_language)
@@ -625,16 +676,67 @@ class FakeAnalysis:
         return _outcome()
 
 
+class FakePublisher:
+    target_key = "portal-push:Youtube"
+
+    def __init__(
+        self,
+        *,
+        publish_result: bool = True,
+        fail_message: str | None = None,
+    ) -> None:
+        self.publish_result = publish_result
+        self.fail_message = fail_message
+        self.build_calls: list[tuple[FetchedVideo, TranslationResult, AnalysisOutcome]] = []
+        self.publish_calls: list[UUID] = []
+
+    def build_steps(
+        self,
+        fetched: FetchedVideo,
+        translation: TranslationResult,
+        outcome: AnalysisOutcome,
+    ) -> list[PublicationStepInput]:
+        self.build_calls.append((fetched, translation, outcome))
+        return [
+            PublicationStepInput(
+                self.target_key,
+                "topic",
+                fetched.metadata.title,
+                "# analysis",
+            ),
+            PublicationStepInput(
+                self.target_key,
+                "translation",
+                None,
+                "# translation",
+            ),
+            PublicationStepInput(
+                self.target_key,
+                "source",
+                None,
+                "# source",
+            ),
+        ]
+
+    async def publish(self, video_analysis_id: UUID) -> bool:
+        self.publish_calls.append(video_analysis_id)
+        if self.fail_message is not None:
+            raise RuntimeError(self.fail_message)
+        return self.publish_result
+
+
 def _service(
     repository: FakeRepository,
     analysis: FakeAnalysis,
     fetched: FetchedVideo,
+    publisher: FakePublisher | None = None,
 ) -> PipelineService:
     return PipelineService(
         _settings(),  # type: ignore[arg-type]
         repository,  # type: ignore[arg-type]
         FakeYoutube(fetched),  # type: ignore[arg-type]
         analysis,  # type: ignore[arg-type]
+        publisher,  # type: ignore[arg-type]
     )
 
 
@@ -652,7 +754,7 @@ async def test_process_video_saves_translation_and_completes_analysis() -> None:
     assert repository.calls == [
         ("save_fetched_video", (fetched.metadata, fetched.subtitle, None), {}),
         (
-            "has_matching_analysis",
+            "get_matching_analysis_id",
             (VIDEO_ID, SUBTITLE_ID),
             {
                 "profile_name": "research-v1",
@@ -705,6 +807,90 @@ async def test_process_video_saves_translation_and_completes_analysis() -> None:
 
 
 @pytest.mark.asyncio
+async def test_process_video_enqueues_then_publishes_completed_analysis() -> None:
+    fetched = _fetched_video()
+    repository = FakeRepository()
+    analysis = FakeAnalysis()
+    publisher = FakePublisher()
+
+    result = await _service(repository, analysis, fetched, publisher).process_video(
+        VIDEO_URL
+    )
+
+    assert result.status == "analyzed"
+    assert publisher.build_calls == [(fetched, _translation(), _outcome())]
+    assert publisher.publish_calls == [ANALYSIS_ID]
+    complete_call = next(
+        call for call in repository.calls if call[0] == "complete_analysis_run"
+    )
+    assert complete_call[2]["publication_steps"] == publisher.build_steps(
+        fetched,
+        _translation(),
+        _outcome(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_publication_failure_does_not_revert_succeeded_analysis_run() -> None:
+    fetched = _fetched_video()
+    repository = FakeRepository()
+    publisher = FakePublisher(fail_message="portal unavailable")
+
+    with pytest.raises(RuntimeError, match="portal unavailable"):
+        await _service(repository, FakeAnalysis(), fetched, publisher).process_video(
+            VIDEO_URL
+        )
+
+    assert publisher.publish_calls == [ANALYSIS_ID]
+    assert any(call[0] == "complete_analysis_run" for call in repository.calls)
+    assert all(call[0] != "fail_analysis_run" for call in repository.calls)
+
+
+@pytest.mark.asyncio
+async def test_matching_analysis_resumes_incomplete_publication_without_agent_calls() -> None:
+    fetched = _fetched_video()
+    repository = FakeRepository(matching_analysis=True, pending_publication=True)
+    analysis = FakeAnalysis()
+    publisher = FakePublisher()
+
+    result = await _service(repository, analysis, fetched, publisher).process_video(
+        VIDEO_URL
+    )
+
+    assert result.status == "published"
+    assert result.detail == "Existing analysis publication completed"
+    assert publisher.publish_calls == [ANALYSIS_ID]
+    assert publisher.build_calls == []
+    assert analysis.calls == []
+    pending_call = next(
+        call
+        for call in repository.calls
+        if call[0] == "get_pending_publication_analysis_id"
+    )
+    assert pending_call[1] == (VIDEO_ID, publisher.target_key)
+    assert all(call[0] != "get_matching_analysis_id" for call in repository.calls)
+
+
+@pytest.mark.asyncio
+async def test_force_does_not_bypass_uncertain_publication() -> None:
+    fetched = _fetched_video()
+    repository = FakeRepository(pending_publication=True)
+    analysis = FakeAnalysis()
+    publisher = FakePublisher(fail_message="uncertain remote result")
+
+    with pytest.raises(RuntimeError, match="uncertain remote result"):
+        await _service(repository, analysis, fetched, publisher).process_video(
+            VIDEO_URL,
+            force=True,
+        )
+
+    assert publisher.publish_calls == [ANALYSIS_ID]
+    assert publisher.build_calls == []
+    assert analysis.calls == []
+    assert all(call[0] != "start_analysis_run" for call in repository.calls)
+
+
+@pytest.mark.asyncio
 async def test_process_video_skips_when_matching_analysis_and_translation_exist() -> None:
     fetched = _fetched_video(
         normalized_text="中文字幕",
@@ -719,7 +905,7 @@ async def test_process_video_skips_when_matching_analysis_and_translation_exist(
     assert result.detail == "Matching analysis already exists"
     assert [call[0] for call in repository.calls] == [
         "save_fetched_video",
-        "has_matching_analysis",
+        "get_matching_analysis_id",
     ]
     assert analysis.calls == [
         ("copy_chinese_source", ("zh-CN", "中文字幕")),
@@ -811,7 +997,7 @@ async def test_matching_chinese_analysis_repairs_missing_copy_before_skip() -> N
     assert [call[0] for call in repository.calls] == [
         "get_stored_video",
         "save_translation",
-        "has_matching_analysis",
+        "get_matching_analysis_id",
     ]
     assert ("save_translation", (SUBTITLE_ID, copied), {}) in repository.calls
     assert repository.stored_video is not None
@@ -895,7 +1081,7 @@ async def test_process_video_skips_stored_matching_analysis_without_fetching() -
     assert youtube.calls == []
     assert [call[0] for call in repository.calls] == [
         "get_stored_video",
-        "has_matching_analysis",
+        "get_matching_analysis_id",
     ]
     assert analysis.calls == []
 
@@ -963,6 +1149,36 @@ async def test_process_video_retranslates_when_stored_translation_contract_chang
 
 
 @pytest.mark.asyncio
+async def test_process_video_retranslates_legacy_traditional_chinese_copy() -> None:
+    fetched = _fetched_video(
+        normalized_text="繁體中文字幕",
+        language_code="zh-Hant",
+    )
+    repository = FakeRepository(
+        stored_video=_stored_video(
+            fetched,
+            translation=_copied_translation("繁體中文字幕", "zh-Hant"),
+        ),
+    )
+    analysis = FakeAnalysis()
+    service = PipelineService(
+        _settings(),  # type: ignore[arg-type]
+        repository,  # type: ignore[arg-type]
+        FakeYoutube(fetched),  # type: ignore[arg-type]
+        analysis,  # type: ignore[arg-type]
+    )
+
+    result = await service.analyze_video("test-video")
+
+    assert result.status == "analyzed"
+    assert analysis.calls == [
+        ("translate", ("zh-Hant", "繁體中文字幕")),
+        ("analyze", (fetched.metadata, "zh-Hant", "translated subtitle")),
+    ]
+    assert any(call[0] == "save_translation" for call in repository.calls)
+
+
+@pytest.mark.asyncio
 async def test_process_video_reuses_stored_terminal_subtitle_state() -> None:
     fetched = _fetched_video(with_subtitle=False)
     repository = FakeRepository(
@@ -1007,7 +1223,7 @@ async def test_process_video_refetches_stored_pending_subtitle_state() -> None:
     assert [call[0] for call in repository.calls] == [
         "get_stored_video",
         "save_fetched_video",
-        "has_matching_analysis",
+        "get_matching_analysis_id",
     ]
     assert analysis.calls == []
 

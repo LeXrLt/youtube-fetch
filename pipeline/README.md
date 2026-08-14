@@ -1,7 +1,7 @@
 # Python Pipeline
 
 Python Pipeline 负责发现频道视频、用 `yt-dlp` 获取元数据和字幕、规范化字幕、直接复制
-中文字幕的翻译字段，并调用 Codex 生成非中文翻译与结构化分析，最后将全过程写入
+简体中文字幕的翻译字段，并调用 Codex 生成其他语言（包括繁体中文）的简体翻译与结构化分析，最后将全过程写入
 PostgreSQL。它只下载字幕，不下载视频
 媒体文件。
 
@@ -10,6 +10,7 @@ PostgreSQL。它只下载字幕，不下载视频
 - Python 3.12，以及随 Python 提供的 `venv` 和 `pip`。
 - 可访问的 PostgreSQL，以及 `psql`、`createdb`、`sha256sum`；运行数据库迁移测试
   还需要 `dropdb`。
+- 可从 `PATH` 调用的 `curl` 和 `jq`，用于向 bbs-go 发布并校验 Markdown 内容。
 - 已安装且可从 `PATH` 调用的 Codex CLI 0.145 或更高兼容版本，并已完成登录认证。
   可用 `codex --version` 和 `codex login status` 检查。
 - Python 依赖固定使用 `codex-sdk-py==0.0.9`。该包是 Codex SDK 的 Python 移植，
@@ -47,6 +48,20 @@ POSTGRES_DB=youtube_fetch
 `localhost`、`5432`。进程环境变量优先于 `.env`。可选的 `CODEX_PATH` 覆盖 Codex
 可执行文件路径，`CODEX_MODEL` 覆盖配置中的模型；通常保持为空以使用已认证 CLI 的
 默认设置。
+
+BBS 凭据不放在项目根目录 `.env`。Pipeline 读取 portal-push skill 的
+`$CODEX_HOME/skills/portal-push/.env`；未设置 `CODEX_HOME` 时默认路径为
+`~/.codex/skills/portal-push/.env`。该文件必须是普通文件、权限严格为 `0600`，且只包含
+以下两个键各一次；远程地址必须使用 HTTPS，不得提交真实值：
+
+```dotenv
+BBS_BASE_URL=https://bbs.example.com
+BBS_TOKEN=your_token
+```
+
+目标 bbs-go 必须存在唯一的普通分类 `Youtube`，发布账号还须满足站点的发帖、邮箱验证、
+观察期和验证码限制。Pipeline 会在写入前检查这些条件。每组三步任务首次领取时会绑定规范化
+门户 origin、稳定用户 ID 和分类 ID；后续恢复若检测到站点、账号或分类漂移，会在远程读写前停止。
 
 Cookie 来源默认是 `auto`：macOS 使用当前用户的 Chrome 登录态，其他平台使用 Netscape
 Cookie 文件。macOS 不需要导出 Cookie，但 Pipeline 必须由登录 Chrome 的同一用户运行，
@@ -106,6 +121,26 @@ pipeline/.venv/bin/python pipeline/main.py channel-inspect '@example'
 下载任务被取消时会先等待正在运行的 yt-dlp 工作线程结束，再释放并发配额和下载锁。
 `config-check`、`migrate`、`channel-inspect` 和 `channel-add` 不占用阶段锁。
 
+每次 `analyze`、`run` 或 `video` 进入分析锁后、开始分析前，Pipeline 默认清理自身以前
+创建且已结束的 Codex Agent 会话。新会话使用项目专属 `youtube_fetch_pipeline` originator；
+升级前由本项目创建的 `codex_sdk_py` 会话仍须同时匹配 Pipeline 专用临时目录才兼容清理。
+清理器会分页检查活动和归档记录，并同时核对 exec 来源、UUIDv7 会话 ID、临时工作目录和
+rollout 首行的结构化 session metadata；rollout 还必须是 Codex 会话目录中的普通文件，任一
+条件无法确认都不会删除。任一次列表刷新超过安全上限时都会停止剩余删除。
+
+临时工作目录仍存在的会话会被视为可能仍在运行。每个候选删除前都会重新枚举 Codex 状态；
+已加载或存在 fork/子会话的候选会跳过，避免官方 `thread/delete` 的递归删除影响其他会话。
+当前协议不支持“仅当未加载且无后代时删除”的原子条件，因此重新枚举与删除之间仍有无法
+彻底消除的极短竞态窗口。删除统一通过 Codex app-server 的官方 `thread/delete` 接口完成，
+不直接改动 `$CODEX_HOME` 中的文件或索引。
+
+该维护操作由 `[agent].cleanup_historical_sessions` 控制，默认是 `true`；
+`session_cleanup_timeout_seconds` 默认是 `300` 且必须大于零。协议、枚举或删除失败会记录不含
+会话内容和会话 ID 的计数或警告，并继续本轮分析；任务取消仍会向上传播。纯 `download` 和
+`channel-add` 不启动清理。若所用 Codex CLI 不兼容 app-server 会话接口，可暂时关闭该开关，
+升级 CLI 后再启用。该功能假设 `CODEX_HOME` 由当前 OS 用户独占；多租户共享同一目录的部署
+应关闭自动清理，尤其不能依赖旧 `codex_sdk_py` originator 的兼容识别。
+
 ```bash
 # 仅创建数据库并应用全部未执行迁移
 pipeline/.venv/bin/python pipeline/main.py migrate
@@ -144,7 +179,7 @@ Codex 负载运行 `analyze --limit N`。两条命令可以同时执行；分析
 继续，不必重新抓取。
 
 命中相同字幕、profile、Schema 版本、提示词版本及相关内容哈希的成功分析时，分析阶段返回
-`skipped`。但对于旧数据中翻译字段缺失的有效中文字幕，`analyze` 会先原样补齐翻译、源语言
+`skipped`。但对于旧数据中翻译字段缺失的有效简体中文字幕，`analyze` 会先原样补齐翻译、源语言
 和复制元数据，再允许该匹配分析返回 `skipped`。该修复不调用 Codex。`--force` 作用于命令
 包含的阶段：
 
@@ -158,6 +193,34 @@ pipeline/.venv/bin/python pipeline/main.py analyze --limit 20 --force
 独立 `download --force` 只强制重新抓取，独立 `analyze --force` 只创建新分析 revision；
 `run --force` 和 `video --force` 同时作用于两个阶段。对 `analyze --force` 使用不限量设置会
 重新分析所有具有有效最新字幕的视频，生产调度应配合 `--limit` 谨慎使用。
+
+## BBS 发布与恢复
+
+`analyze`、`run` 和 `video` 在生成分析时会触发 BBS 发布；`download` 不会。翻译和分析
+完成后，`complete_analysis_run` 先在同一数据库事务中提交成功的 analysis revision 以及
+`topic`、`translation`、`source` 三步 outbox 快照，事务成功后才向 bbs-go 的 `Youtube`
+分类发送 Markdown。主题正文包含视频信息和 AI 分析，第一条一级评论为中文翻译，第二条
+一级评论为原文字幕。源语言去除首尾空白、将下划线规范化为连字符并忽略大小写后，只有
+`zh`、`zh-Hans`、`zh-CN`、`zh-SG` 被视为简体中文；这些语言跳过原文评论，其他语言包括
+繁体中文先由 Agent 翻译为简体中文，并继续发布繁体原文评论。
+
+每次成功写入后都会用远程读取接口回读校验，再推进对应 outbox 状态；已记录远程 ID 的
+`created` 步骤可在下次运行时继续回读并完成。仅完成本地领取的 `claimed` 步骤可安全重领，
+明确失败且可确认未写入的步骤可恢复执行。
+GET 读取允许有限重试，但创建主题和评论的 POST 不自动重试，因为它们不是幂等操作。如果
+真正开始 POST 后发生进程中断、请求传输失败或响应不可判定，步骤会标记为 `uncertain`，后续运行停止自动发布；
+必须先人工核对远程站点是否已产生主题或评论，再处理数据库状态。该机制用于断点恢复和降低
+重复风险，不提供 exactly-once 保证。
+
+门户请求只通过 `curl` 发出，并禁用用户级 `.curlrc`、重定向和跨协议请求；认证 Header 位于
+权限受限的临时文件。单个响应上限为 8 MiB，评论回读累计上限为 64 MiB，分页响应在解析后
+立即删除。模型生成的分析字段按纯文本写入 Markdown，参考链接只接受 HTTP(S)，避免字幕
+提示注入产生可执行 HTML。
+
+功能上线前已经成功完成、因而没有 `bbs_publication_steps` 快照的历史分析不会自动回填。
+普通运行会恢复当前匹配 analysis revision 的未完成发布；使用 `--force` 创建的新 revision
+拥有自己独立的三步快照并各自发布，可能因此产生新的 BBS 主题。只要同一视频和目标存在
+`uncertain` 步骤，`--force` 也不会创建或发布新 revision，必须先完成人工核对。
 
 未指定 `--channel` 时，`download` 和 `run` 从 PostgreSQL 的 `youtube_channels` 表读取
 `is_active = true` 的频道；不会读取或同步 Cookie 登录用户的订阅列表。Web 管理页新增或
@@ -191,11 +254,11 @@ pipeline/.venv/bin/python pipeline/main.py analyze --limit 20 --force
 一次运行不会重新读取队列，因此本轮失败不会立即反复执行。即使
 `--max-videos-per-channel` 限制了本轮频道发现范围，该频道以前遗留的 `0` 和 `2` 仍会恢复。
 
-每个视频的完整元数据和字幕在下载阶段独立提交。有效规范化中文字幕的翻译复制包含在保存
-字幕的同一事务中；非中文翻译与分析在后续分析阶段独立提交。
+每个视频的完整元数据和字幕在下载阶段独立提交。有效规范化简体中文字幕的翻译复制包含在
+保存字幕的同一事务中；繁体中文及非中文翻译与分析在后续分析阶段独立提交。
 `subtitle_status` 继续区分 `pending`、`fetched`、`unavailable` 和 `invalid` 等内容状态；确认
 无字幕或字幕无法规范化也属于下载完成，数值状态为 `1`，普通下载不会重复抓取。分析阶段只
-读取每个视频最新且可规范化的字幕；它先修复遗留的中文字幕缺失翻译，再跳过已有匹配成功
+读取每个视频最新且可规范化的字幕；它先修复遗留的简体中文字幕缺失翻译，再跳过已有匹配成功
 revision 的视频。失败或取消的分析可在下一轮恢复。
 
 全局 `--log-level` 默认是 `INFO`。默认日志隐藏 yt-dlp 的网页、播放器 API 等底层请求进度，
@@ -219,6 +282,10 @@ revision 的视频。失败或取消的分析可在下一轮恢复。
 `zh-*` 且翻译字段缺失的字幕回填原文、源语言和 `copied_chinese_source` 迁移元数据；已有
 翻译不会被覆盖。
 
+`013_bbs_publication_steps.sql` 增加不可变的 BBS Markdown outbox 快照、逐步状态、远程 ID、
+请求/响应元数据和恢复索引。Pipeline 业务命令会自动应用该迁移；独立部署 Web 或升级调度
+前仍须显式运行 `./db/migrate.sh`。
+
 ## 字幕选择与处理
 
 默认语言优先级是简体中文、繁体中文、英文。只有 `pipeline.toml` 明确列出的语言和
@@ -233,10 +300,10 @@ revision 的视频。失败或取消的分析可在下一轮恢复。
 
 无法找到合格字幕时状态为 `no_subtitle`。字幕已下载但为空、格式不支持或无法解析时，
 原文仍会保存，`normalized_text` 保持空值，状态为 `invalid_subtitle`，不会启动翻译或
-分析。规范化成功后，中文（包括简体和繁体）在 `download` 保存字幕的同一事务中，将
+分析。规范化成功后，简体中文在 `download` 保存字幕的同一事务中，将
 `normalized_text` 原样复制到 `translated_text`，将源语言写入
 `translated_language_code`，并记录 `mode = copied_chinese_source` 元数据；此过程不等待
-`analyze`，也不调用 Codex。非中文仍在 `analyze` 阶段按配置分块调用 Codex 翻译为简体
+`analyze`，也不调用 Codex。繁体中文和非中文仍在 `analyze` 阶段按配置分块调用 Codex 翻译为简体
 中文，再执行分析。
 
 ## 提示词与结构化输出

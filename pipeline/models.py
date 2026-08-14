@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 
@@ -155,6 +155,48 @@ class AnalysisOutcome:
     payload: dict[str, Any]
     projection: AnalysisProjection
     metadata: dict[str, Any]
+
+
+PublicationStepName = Literal["topic", "translation", "source"]
+PublicationStepStatus = Literal[
+    "pending",
+    "claimed",
+    "in_progress",
+    "created",
+    "succeeded",
+    "failed",
+    "uncertain",
+    "skipped",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationStepInput:
+    target_key: str
+    step: PublicationStepName
+    topic_title: str | None
+    markdown_snapshot: str | None
+    skipped: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationStep:
+    video_analysis_id: UUID
+    target_key: str
+    step: PublicationStepName
+    topic_title: str | None
+    markdown_snapshot: str | None
+    content_sha256: str | None
+    status: PublicationStepStatus
+    remote_topic_id: str | None
+    remote_comment_id: int | None
+    remote_status: int | None
+    attempt_count: int
+    error_message: str | None
+    request_metadata: dict[str, Any]
+    response_metadata: dict[str, Any]
+    started_at: datetime | None
+    completed_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)

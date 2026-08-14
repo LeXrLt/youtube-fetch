@@ -7,11 +7,39 @@ import pytest
 from pydantic import ValidationError
 
 import config as config_module
-from config import PIPELINE_ROOT, PipelineSettings, load_settings
+from config import PIPELINE_ROOT, AgentSettings, PipelineSettings, load_settings
 
 
 def test_pipeline_settings_defaults_download_concurrency_to_four() -> None:
     assert PipelineSettings().download_concurrency == 4
+
+
+def test_agent_settings_enable_session_cleanup_by_default() -> None:
+    settings = AgentSettings(
+        prompt_file=Path("prompts.toml"),
+        translation_schema_file=Path("translation.schema.json"),
+        analysis_schema_file=Path("analysis.schema.json"),
+        profile_name="test",
+        schema_version="1",
+    )
+
+    assert settings.cleanup_historical_sessions is True
+    assert settings.session_cleanup_timeout_seconds == 300
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_agent_settings_rejects_nonpositive_session_cleanup_timeout(
+    value: float,
+) -> None:
+    with pytest.raises(ValidationError, match="session_cleanup_timeout_seconds"):
+        AgentSettings(
+            session_cleanup_timeout_seconds=value,
+            prompt_file=Path("prompts.toml"),
+            translation_schema_file=Path("translation.schema.json"),
+            analysis_schema_file=Path("analysis.schema.json"),
+            profile_name="test",
+            schema_version="1",
+        )
 
 
 @pytest.mark.asyncio
@@ -40,6 +68,8 @@ async def test_load_settings_prefers_process_environment(
     assert settings.database.password.get_secret_value() == "environment-password"
     assert settings.pipeline.download_concurrency == 4
     assert settings.youtube.cookie_source == "file"
+    assert settings.agent.cleanup_historical_sessions is True
+    assert settings.agent.session_cleanup_timeout_seconds == 300
 
 
 @pytest.mark.parametrize("value", [0, 17])

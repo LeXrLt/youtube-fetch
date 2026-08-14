@@ -3,7 +3,7 @@
 ## 1. 项目概述
 
 本项目聚合约几十位 AI 研究员的 YouTube 内容。Python Pipeline 从 PostgreSQL 读取
-已启用频道，并使用 `yt-dlp` 获取视频元数据和字幕，再由 Codex Agent 对非中文字幕执行
+已启用频道，并使用 `yt-dlp` 获取视频元数据和字幕，再由 Codex Agent 对非简体中文字幕执行
 翻译，并对字幕执行过滤、背景补充、评分和标签提取。结构化结果写入 PostgreSQL，由
 Next.js App 读取并展示。
 
@@ -22,9 +22,11 @@ Next.js App 读取并展示。
 - 通过只读 `channel-inspect` 接口规范化频道输入并验证 YouTube 频道元数据。
 - 通过 `yt-dlp` 获取视频元数据和可用字幕。
 - 清洗、规范化字幕，保留原始字幕以便重新处理。
-- 对有效规范化中文字幕直接复制翻译字段；调用 Codex Agent 翻译非中文字幕，并完成
+- 对有效规范化简体中文字幕直接复制翻译字段；调用 Codex Agent 翻译繁体及非中文字幕，并完成
   相关性过滤、背景补充、评分和标签提取。
 - 将视频元数据、字幕、分析过程和分析结果写入 PostgreSQL。
+- 在成功提交分析和不可变 outbox 快照后，通过 bbs-go 将 AI 分析、翻译和按语言规则保留的
+  原文发布到 `Youtube` 分类，并回读校验远程结果。
 
 Python 中涉及 HTTP、文件和数据库的 I/O 路径应优先采用异步实现。所有 Python
 命令和依赖安装必须使用 `pipeline/.venv`；完整安装和操作说明见
@@ -57,8 +59,9 @@ PostgreSQL 由本机已有服务提供，本项目不负责安装或部署数据
 下载与分析以 PostgreSQL 中已提交的视频和字幕为持久边界，数据流如下：
 
 ```text
-YouTube -> yt-dlp -> 字幕清洗 -> 中文字幕翻译字段复制 -> PostgreSQL
+YouTube -> yt-dlp -> 字幕清洗 -> 简体中文字幕翻译字段复制 -> PostgreSQL
 PostgreSQL -> Codex Agent -> PostgreSQL -> Next.js App
+                                  -> bbs-go Youtube 分类
 ```
 
 下载阶段完成后不等待 Agent 即可释放下载调度资源；分析阶段只读取数据库，不访问 YouTube。
@@ -92,6 +95,12 @@ WEB_ROUTE_KEY=<生成的 32 位密钥>
 页面通过 `/<密钥>` 访问，根路径返回 404。生产环境也可以直接向 Web 进程提供这两个变量，
 进程环境变量优先于 `.env.local`；构建和运行必须使用相同的 `WEB_ROUTE_KEY`。
 
+BBS 使用 portal-push skill 的独立凭据文件：`$CODEX_HOME/skills/portal-push/.env`；没有
+`CODEX_HOME` 时读取 `~/.codex/skills/portal-push/.env`。它必须是非符号链接的普通文件、
+权限严格为 `0600`，且只定义 `BBS_BASE_URL` 和 `BBS_TOKEN` 各一次。远程
+`BBS_BASE_URL` 必须是 HTTPS origin。不要把真实 BBS 地址或 token 写入项目 `.env`、文档、
+日志或测试输出。
+
 YouTube Cookie 来源由 `[youtube].cookie_source` 控制，默认 `auto`：macOS 直接读取当前
 用户的 Chrome Cookie，其他平台读取 `pipeline/config/youtube.cookies.txt`。macOS 使用
 Chrome 时，运行 Pipeline 的系统用户必须与登录 Chrome 的用户相同，并允许进程访问已解锁
@@ -107,7 +116,8 @@ Chrome 时，运行 Pipeline 的系统用户必须与登录 Chrome 的用户相�
 `dropdb`。数据库用户须能连接 `postgres` 数据库、创建 `youtube_fetch`，并能在
 项目数据库中创建扩展和表。Pipeline 还要求 Python 3.12（含 `venv` 和 `pip`）、已认证且兼容
 0.145 及以上版本的 Codex CLI；`codex-sdk-py==0.0.9` 是调用系统 Codex CLI 的
-Python 移植，不包含 CLI 二进制。Next.js App 要求 Node.js 20.9 或更高版本，依赖由
+Python 移植，不包含 CLI 二进制。BBS 客户端要求 `curl` 和 `jq` 可从 `PATH` 调用。
+Next.js App 要求 Node.js 20.9 或更高版本，依赖由
 `web/package.json` 和 `web/package-lock.json` 管理。
 
 Pipeline 是平铺脚本目录，不构建或安装项目包。虚拟环境和依赖从项目根目录创建：
@@ -179,11 +189,30 @@ Pipeline 先把发现的视频引用幂等登记到 `videos`，再一次性读�
 新失败只写入状态和错误信息，不重新查询或重新入队，因此会继续处理后续任务并在下次启动时
 排到待下载任务之后重试。`unavailable` 和 `invalid` 仍保留在原有 `subtitle_status` 中，且
 对应数值状态 `1`，避免把“确认无字幕”或“已下载但无法规范化”误当成传输失败反复抓取。
-有效规范化中文字幕在保存字幕的同一事务中将 `normalized_text` 原样复制到
+有效规范化简体中文字幕在保存字幕的同一事务中将 `normalized_text` 原样复制到
 `translated_text`，同时写入源语言和 `copied_chinese_source` 元数据，不等待 `analyze`，
-也不调用 Codex。非中文字幕仍由后续 `analyze` 阶段调用 Codex 翻译。字幕下载完成即提交到
-PostgreSQL，后续分析失败或取消时可独立恢复；`analyze` 遇到旧数据中缺失翻译的有效中文
+也不调用 Codex。繁体中文及非中文字幕仍由后续 `analyze` 阶段调用 Codex 翻译。字幕下载
+完成即提交到 PostgreSQL，后续分析失败或取消时可独立恢复；`analyze` 遇到旧数据中缺失翻译的有效简体中文
 字幕时，会先补齐同样的复制结果，再允许命中既有成功分析并返回 `skipped`。
+
+分析发布采用三步持久化 outbox。`complete_analysis_run` 在提交成功 analysis revision 的
+同一事务中写入 `topic`、`translation`、`source` 的不可变 Markdown 快照，提交后才依次向
+bbs-go 写入“AI 分析主题、中文翻译一级评论、原文字幕一级评论”并逐步回读验证。源语言经
+trim、下划线转连字符和大小写规范化后，仅 `zh`、`zh-Hans`、`zh-CN`、`zh-SG` 跳过原文
+评论；繁体中文会翻译为简体并保留繁体原文，其他语言均保留原文评论。`analyze`、`run`、
+`video` 会触发发布，`download` 不会。
+
+远程 GET 可有限重试，非幂等 POST 不自动重试。只完成本地领取的 `claimed` 可安全重领，
+`created` 状态可依照已保存远程 ID 恢复回读，明确未写入的 `failed` 状态可再次执行；真正开始
+POST 后中断或传输结果不明会进入 `uncertain`，必须人工检查
+远程主题或评论，不能自动重放。这不是 exactly-once 协议。上线前没有 outbox 行的历史成功
+分析不会回填；每个 `--force` 新 revision 都生成并发布自己的一组三步快照，但同一视频和目标
+存在 `uncertain` 时必须先人工核对，不能用 `--force` 绕过。
+
+首次领取会把规范化门户 origin、稳定用户 ID、分类 ID 和账号名写入不可变目标元数据；恢复
+时先在任何认证请求前校验 origin，再核对账号和分类，配置不一致时禁止继续。`curl` 禁用默认
+配置和重定向；单响应限制为 8 MiB，评论回读累计限制为 64 MiB且逐页清理。模型派生字段按
+纯文本转义，外部参考链接仅允许 HTTP(S)。
 
 运行日志以业务状态为可观测边界。默认 `INFO` 记录频道发现的模式、数量和停止原因，以及
 字幕任务的开始、成功、无匹配字幕、无法规范化、跳过、失败和 `retry` 队列来源。yt-dlp 的
@@ -214,11 +243,12 @@ PostgreSQL，后续分析失败或取消时可独立恢复；`analyze` 遇到旧
 | `video_analyses` | profile、Schema 版本、投影字段、分析元数据和完整 JSONB Agent 输出 |
 | `tags` | 可复用标签及标签分类 |
 | `video_analysis_tags` | 分析结果与标签的多对多关系及置信度 |
+| `bbs_publication_steps` | 每个 analysis revision 的三步不可变 BBS Markdown 快照、发布状态、远程 ID 和验证元数据 |
 
 `schema_migrations` 由迁移脚本维护，不属于业务表，其中保存迁移文件名、SHA-256
 和应用时间。主键使用 UUID；关键外键、唯一约束、0 到 100 的评分范围约束及列表
 查询常用索引由迁移创建。当前迁移链截至
-`012_backfill_chinese_translations.sql`：
+`013_bbs_publication_steps.sql`：
 
 - `002` 约束分析引用的字幕必须属于同一视频。
 - `003` 增加翻译字段与元数据、run 的视频/字幕身份、分析 profile、输出 Schema 版本、
@@ -236,6 +266,8 @@ PostgreSQL，后续分析失败或取消时可独立恢复；`analyze` 遇到旧
   部分索引。
 - `012` 为旧库中具有有效规范化文本但缺失翻译的中文（`zh` 或 `zh-*`）字幕回填原文、
   源语言和 `copied_chinese_source` 迁移元数据；已有翻译不覆盖。
+- `013` 增加 `bbs_publication_steps`，约束每个 analysis revision 的主题、翻译和原文三步
+  快照及状态，禁止修改目标与内容快照，并为待恢复步骤建立部分索引。
 
 完整 Agent 输出保存在 `video_analyses.raw_agent_output` JSONB，以允许 Schema 演进；
 稳定查询字段通过 `pipeline/config/pipeline.toml` 中的 JSON Pointer 投影到关系字段。
@@ -252,11 +284,12 @@ profile、Schema 版本和提示词版本共同决定是否复用已有分析。
 ./db/test_migrations.sh
 ```
 
-第一次执行应创建数据库并应用所有未执行迁移；第二次执行应对 `001` 至 `012` 均输出
+第一次执行应创建数据库并应用所有未执行迁移；第二次执行应对 `001` 至 `013` 均输出
 `Skipping ...`。
 测试脚本会预留并标记一个高熵名称的临时数据库，验证空库并发迁移、重复执行、
 环境变量优先级、迁移校验和、失败回滚、表结构、下载状态约束与历史回填、中文翻译回填、
-跨视频字幕约束和删除字幕后的引用清理，结束时自动删除临时数据库和测试文件。
+BBS 发布步骤约束与快照不可变性、跨视频字幕约束和删除字幕后的引用清理，结束时自动删除
+临时数据库和测试文件。
 
 可以使用以下命令检查项目数据库的迁移记录和表：
 

@@ -18,7 +18,7 @@ from models import (
     TranslationResult,
     VideoMetadata,
 )
-from subtitles import is_chinese_language
+from subtitles import is_simplified_chinese_language
 
 
 class AnalysisInputError(ValueError):
@@ -151,7 +151,9 @@ class AnalysisEngine:
         source_language: str,
         subtitle_text: str,
     ) -> TranslationResult | None:
-        if not is_chinese_language(source_language):
+        """Copy only source variants already written in Simplified Chinese."""
+
+        if not is_simplified_chinese_language(source_language):
             return None
         return TranslationResult(
             translated_text=subtitle_text,

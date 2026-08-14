@@ -16,6 +16,8 @@ from models import (
     ChannelRecord,
     DownloadedSubtitle,
     FetchedVideo,
+    PublicationStep,
+    PublicationStepInput,
     StoredVideo,
     SubtitleDownloadStatus,
     SubtitleDownloadTask,
@@ -612,12 +614,13 @@ class PipelineRepository:
         schema_sha256: str,
         force: bool,
         limit: int | None,
+        publication_target_key: str | None = None,
     ) -> list[VideoReference]:
         rows = await self._require_pool().fetch(
             """
             SELECT video.youtube_video_id, video.video_url
             FROM videos AS video
-            JOIN LATERAL (
+            LEFT JOIN LATERAL (
                 SELECT subtitle.id,
                        subtitle.normalized_text,
                        subtitle.translated_text,
@@ -629,10 +632,43 @@ class PipelineRepository:
                          subtitle.id DESC
                 LIMIT 1
             ) AS latest_subtitle ON true
-            WHERE latest_subtitle.normalized_text IS NOT NULL
-              AND (
-                  $7::boolean
-                  OR NOT EXISTS (
+            LEFT JOIN LATERAL (
+                SELECT analysis.id
+                FROM video_analyses AS analysis
+                WHERE $8::text IS NOT NULL
+                  AND analysis.video_id = video.id
+                  AND EXISTS (
+                      SELECT 1
+                      FROM bbs_publication_steps AS publication
+                      WHERE publication.video_analysis_id = analysis.id
+                        AND publication.target_key = $8
+                        AND publication.status IN (
+                            'pending',
+                            'claimed',
+                            'in_progress',
+                            'created',
+                            'failed'
+                        )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM bbs_publication_steps AS blocked_publication
+                      WHERE blocked_publication.video_analysis_id = analysis.id
+                        AND blocked_publication.target_key = $8
+                        AND blocked_publication.status = 'uncertain'
+                  )
+                ORDER BY analysis.analyzed_at ASC,
+                         analysis.created_at ASC,
+                         analysis.id ASC
+                LIMIT 1
+            ) AS pending_publication ON true
+            WHERE (
+               pending_publication.id IS NOT NULL
+               OR (
+                  latest_subtitle.normalized_text IS NOT NULL
+                  AND (
+                    $7::boolean
+                    OR NOT EXISTS (
                       SELECT 1
                       FROM video_analyses AS analysis
                       JOIN analysis_runs AS run
@@ -652,10 +688,23 @@ class PipelineRepository:
                         )
                         AND latest_subtitle.translated_text IS NOT NULL
                         AND latest_subtitle.translated_language_code IS NOT NULL
+                    )
                   )
+               )
+            )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM video_analyses AS blocked_analysis
+                  JOIN bbs_publication_steps AS blocked_publication
+                    ON blocked_publication.video_analysis_id = blocked_analysis.id
+                  WHERE blocked_analysis.video_id = video.id
+                    AND blocked_publication.target_key = $8
+                    AND blocked_publication.status = 'uncertain'
               )
-            ORDER BY video.created_at ASC, video.id ASC
-            LIMIT $8::integer
+            ORDER BY (pending_publication.id IS NULL) ASC,
+                     video.created_at ASC,
+                     video.id ASC
+            LIMIT $9::integer
             """,
             profile_name,
             schema_version,
@@ -664,6 +713,7 @@ class PipelineRepository:
             translation_schema_sha256,
             schema_sha256,
             force,
+            publication_target_key,
             limit,
         )
         return [
@@ -673,6 +723,46 @@ class PipelineRepository:
             )
             for row in rows
         ]
+
+    async def get_pending_publication_analysis_id(
+        self,
+        video_id: UUID,
+        target_key: str,
+    ) -> UUID | None:
+        return await self._require_pool().fetchval(
+            """
+            SELECT analysis.id
+            FROM video_analyses AS analysis
+            WHERE analysis.video_id = $1
+              AND EXISTS (
+                  SELECT 1
+                  FROM bbs_publication_steps AS publication
+                  WHERE publication.video_analysis_id = analysis.id
+                    AND publication.target_key = $2
+                    AND publication.status IN (
+                        'pending',
+                        'claimed',
+                        'in_progress',
+                        'created',
+                        'failed',
+                        'uncertain'
+                    )
+              )
+            ORDER BY CASE WHEN EXISTS (
+                         SELECT 1
+                         FROM bbs_publication_steps AS blocked_publication
+                         WHERE blocked_publication.video_analysis_id = analysis.id
+                           AND blocked_publication.target_key = $2
+                           AND blocked_publication.status = 'uncertain'
+                     ) THEN 0 ELSE 1 END,
+                     analysis.analyzed_at ASC,
+                     analysis.created_at ASC,
+                     analysis.id ASC
+            LIMIT 1
+            """,
+            video_id,
+            target_key,
+        )
 
     async def has_matching_analysis(
         self,
@@ -687,39 +777,79 @@ class PipelineRepository:
         schema_sha256: str,
         source_sha256: str,
     ) -> bool:
-        return bool(
-            await self._require_pool().fetchval(
-                """
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM video_analyses AS analysis
-                    JOIN analysis_runs AS run ON run.id = analysis.analysis_run_id
-                    JOIN subtitle_tracks AS subtitle
-                      ON subtitle.id = analysis.subtitle_track_id
-                    WHERE analysis.video_id = $1
-                      AND analysis.subtitle_track_id = $2
-                      AND analysis.profile_name = $3
-                      AND analysis.output_schema_version = $4
-                      AND run.status = 'succeeded'
-                      AND run.prompt_version = $5
-                      AND run.metadata ->> 'prompt_sha256' = $6
-                      AND run.metadata ->> 'translation_schema_sha256' = $7
-                      AND run.metadata ->> 'schema_sha256' = $8
-                      AND run.metadata ->> 'source_sha256' = $9
-                      AND subtitle.translated_text IS NOT NULL
-                      AND subtitle.translated_language_code IS NOT NULL
-                )
-                """,
+        return (
+            await self.get_matching_analysis_id(
                 video_id,
                 subtitle_track_id,
-                profile_name,
-                schema_version,
-                prompt_version,
-                prompt_sha256,
-                translation_schema_sha256,
-                schema_sha256,
-                source_sha256,
+                profile_name=profile_name,
+                schema_version=schema_version,
+                prompt_version=prompt_version,
+                prompt_sha256=prompt_sha256,
+                translation_schema_sha256=translation_schema_sha256,
+                schema_sha256=schema_sha256,
+                source_sha256=source_sha256,
             )
+            is not None
+        )
+
+    async def get_matching_analysis_id(
+        self,
+        video_id: UUID,
+        subtitle_track_id: UUID,
+        *,
+        profile_name: str,
+        schema_version: str,
+        prompt_version: str,
+        prompt_sha256: str,
+        translation_schema_sha256: str,
+        schema_sha256: str,
+        source_sha256: str,
+        publication_target_key: str | None = None,
+    ) -> UUID | None:
+        return await self._require_pool().fetchval(
+            """
+            SELECT analysis.id
+            FROM video_analyses AS analysis
+            JOIN analysis_runs AS run ON run.id = analysis.analysis_run_id
+            JOIN subtitle_tracks AS subtitle
+              ON subtitle.id = analysis.subtitle_track_id
+            WHERE analysis.video_id = $1
+              AND analysis.subtitle_track_id = $2
+              AND analysis.profile_name = $3
+              AND analysis.output_schema_version = $4
+              AND run.status = 'succeeded'
+              AND run.prompt_version = $5
+              AND run.metadata ->> 'prompt_sha256' = $6
+              AND run.metadata ->> 'translation_schema_sha256' = $7
+              AND run.metadata ->> 'schema_sha256' = $8
+              AND run.metadata ->> 'source_sha256' = $9
+              AND subtitle.translated_text IS NOT NULL
+              AND subtitle.translated_language_code IS NOT NULL
+            ORDER BY CASE
+                       WHEN $10::text IS NOT NULL AND EXISTS (
+                           SELECT 1
+                           FROM bbs_publication_steps AS publication
+                           WHERE publication.video_analysis_id = analysis.id
+                             AND publication.target_key = $10
+                             AND publication.status NOT IN ('succeeded', 'skipped')
+                       ) THEN 0
+                       ELSE 1
+                     END,
+                     analysis.analyzed_at DESC,
+                     analysis.created_at DESC,
+                     analysis.id DESC
+            LIMIT 1
+            """,
+            video_id,
+            subtitle_track_id,
+            profile_name,
+            schema_version,
+            prompt_version,
+            prompt_sha256,
+            translation_schema_sha256,
+            schema_sha256,
+            source_sha256,
+            publication_target_key,
         )
 
     async def start_analysis_run(
@@ -838,7 +968,9 @@ class PipelineRepository:
         profile_name: str,
         schema_version: str,
         run_metadata: dict[str, Any],
+        publication_steps: Sequence[PublicationStepInput] = (),
     ) -> UUID:
+        normalized_publication_steps = _validate_publication_steps(publication_steps)
         pool = self._require_pool()
         projection = outcome.projection
         async with pool.acquire() as connection, connection.transaction():
@@ -906,6 +1038,37 @@ class PipelineRepository:
                     tag_id,
                     tag["confidence"],
                 )
+            if normalized_publication_steps:
+                await connection.executemany(
+                    """
+                    INSERT INTO bbs_publication_steps(
+                        video_analysis_id,
+                        target_key,
+                        step,
+                        topic_title,
+                        markdown_snapshot,
+                        status,
+                        completed_at
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5,
+                        CASE WHEN $6 THEN 'skipped' ELSE 'pending' END,
+                        CASE WHEN $6 THEN now() ELSE NULL END
+                    )
+                    ON CONFLICT (video_analysis_id, target_key, step) DO NOTHING
+                    """,
+                    [
+                        (
+                            analysis_id,
+                            step.target_key,
+                            step.step,
+                            step.topic_title,
+                            step.markdown_snapshot,
+                            step.skipped,
+                        )
+                        for step in normalized_publication_steps
+                    ],
+                )
             await connection.execute(
                 """
                 UPDATE analysis_runs
@@ -918,6 +1081,230 @@ class PipelineRepository:
                 _json(run_metadata),
             )
             return analysis_id
+
+    async def list_publication_steps(
+        self,
+        video_analysis_id: UUID,
+        target_key: str,
+    ) -> list[PublicationStep]:
+        rows = await self._require_pool().fetch(
+            """
+            SELECT video_analysis_id, target_key, step, topic_title,
+                   markdown_snapshot, content_sha256, status,
+                   remote_topic_id, remote_comment_id, remote_status,
+                   attempt_count, error_message, request_metadata,
+                   response_metadata, started_at, completed_at
+            FROM bbs_publication_steps
+            WHERE video_analysis_id = $1 AND target_key = $2
+            ORDER BY CASE step
+                WHEN 'topic' THEN 1
+                WHEN 'translation' THEN 2
+                WHEN 'source' THEN 3
+                ELSE 4
+            END
+            """,
+            video_analysis_id,
+            target_key,
+        )
+        return [
+            PublicationStep(
+                video_analysis_id=row["video_analysis_id"],
+                target_key=row["target_key"],
+                step=row["step"],
+                topic_title=row["topic_title"],
+                markdown_snapshot=row["markdown_snapshot"],
+                content_sha256=row["content_sha256"],
+                status=row["status"],
+                remote_topic_id=row["remote_topic_id"],
+                remote_comment_id=row["remote_comment_id"],
+                remote_status=row["remote_status"],
+                attempt_count=row["attempt_count"],
+                error_message=row["error_message"],
+                request_metadata=_json_object(row["request_metadata"]),
+                response_metadata=_json_object(row["response_metadata"]),
+                started_at=row["started_at"],
+                completed_at=row["completed_at"],
+            )
+            for row in rows
+        ]
+
+    async def claim_publication_step(
+        self,
+        video_analysis_id: UUID,
+        target_key: str,
+        step: str,
+        request_metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        normalized_metadata = _validate_publication_request_metadata(request_metadata)
+        claimed = await self._require_pool().fetchval(
+            """
+            UPDATE bbs_publication_steps
+            SET status = 'claimed',
+                attempt_count = CASE
+                    WHEN status = 'claimed' THEN attempt_count
+                    ELSE attempt_count + 1
+                END,
+                error_message = NULL,
+                remote_topic_id = NULL,
+                remote_comment_id = NULL,
+                remote_status = NULL,
+                request_metadata = request_metadata || $4::jsonb,
+                started_at = NULL,
+                completed_at = NULL,
+                updated_at = now()
+            WHERE video_analysis_id = $1
+              AND target_key = $2
+              AND step = $3
+              AND status IN ('pending', 'failed', 'claimed')
+              AND (
+                  NOT (request_metadata ? 'portal_target')
+                  OR request_metadata -> 'portal_target'
+                     = ($4::jsonb) -> 'portal_target'
+              )
+            RETURNING true
+            """,
+            video_analysis_id,
+            target_key,
+            step,
+            _json(normalized_metadata),
+        )
+        return bool(claimed)
+
+    async def mark_publication_step_in_progress(
+        self,
+        video_analysis_id: UUID,
+        target_key: str,
+        step: str,
+    ) -> bool:
+        started = await self._require_pool().fetchval(
+            """
+            UPDATE bbs_publication_steps
+            SET status = 'in_progress',
+                started_at = now(),
+                updated_at = now()
+            WHERE video_analysis_id = $1
+              AND target_key = $2
+              AND step = $3
+              AND status = 'claimed'
+            RETURNING true
+            """,
+            video_analysis_id,
+            target_key,
+            step,
+        )
+        return bool(started)
+
+    async def mark_publication_step_created(
+        self,
+        video_analysis_id: UUID,
+        target_key: str,
+        step: str,
+        *,
+        remote_topic_id: str | None,
+        remote_comment_id: int | None,
+        remote_status: int | None,
+        response_metadata: dict[str, Any],
+    ) -> None:
+        if step == "topic":
+            if not remote_topic_id or remote_comment_id is not None:
+                raise ValueError("topic creation requires only a remote topic ID")
+        elif step in {"translation", "source"}:
+            if remote_topic_id is not None or not isinstance(remote_comment_id, int):
+                raise ValueError("comment creation requires only a remote comment ID")
+        else:
+            raise ValueError(f"Unsupported publication step: {step}")
+        updated = await self._require_pool().fetchval(
+            """
+            UPDATE bbs_publication_steps
+            SET status = 'created',
+                remote_topic_id = $4,
+                remote_comment_id = $5,
+                remote_status = $6,
+                response_metadata = response_metadata || $7::jsonb,
+                updated_at = now()
+            WHERE video_analysis_id = $1
+              AND target_key = $2
+              AND step = $3
+              AND status = 'in_progress'
+            RETURNING true
+            """,
+            video_analysis_id,
+            target_key,
+            step,
+            remote_topic_id,
+            remote_comment_id,
+            remote_status,
+            _json(response_metadata),
+        )
+        if not updated:
+            raise RuntimeError(f"Publication step is not in progress: {step}")
+
+    async def mark_publication_step_succeeded(
+        self,
+        video_analysis_id: UUID,
+        target_key: str,
+        step: str,
+        *,
+        remote_status: int | None,
+        response_metadata: dict[str, Any],
+    ) -> None:
+        updated = await self._require_pool().fetchval(
+            """
+            UPDATE bbs_publication_steps
+            SET status = 'succeeded',
+                remote_status = COALESCE($4, remote_status),
+                error_message = NULL,
+                response_metadata = response_metadata || $5::jsonb,
+                completed_at = now(),
+                updated_at = now()
+            WHERE video_analysis_id = $1
+              AND target_key = $2
+              AND step = $3
+              AND status = 'created'
+            RETURNING true
+            """,
+            video_analysis_id,
+            target_key,
+            step,
+            remote_status,
+            _json(response_metadata),
+        )
+        if not updated:
+            raise RuntimeError(f"Publication step has not recorded a remote object: {step}")
+
+    async def mark_publication_step_failed(
+        self,
+        video_analysis_id: UUID,
+        target_key: str,
+        step: str,
+        error_message: str,
+        *,
+        uncertain: bool,
+    ) -> None:
+        message = error_message.strip()
+        if not message:
+            raise ValueError("Publication failure requires a non-empty error message")
+        updated = await self._require_pool().fetchval(
+            """
+            UPDATE bbs_publication_steps
+            SET status = CASE WHEN $5 THEN 'uncertain' ELSE 'failed' END,
+                error_message = $4,
+                completed_at = now(),
+                updated_at = now()
+            WHERE video_analysis_id = $1
+              AND target_key = $2
+              AND step = $3
+              AND status = 'in_progress'
+            RETURNING true
+            """,
+            video_analysis_id,
+            target_key,
+            step,
+            message[:8000],
+            uncertain,
+        )
+        if not updated:
+            raise RuntimeError(f"Publication step is not in progress: {step}")
 
     async def fail_analysis_run(
         self,
@@ -1040,6 +1427,73 @@ class PipelineRepository:
         if self._pool is None:
             raise DatabaseNotStartedError("Database pool is not connected")
         return self._pool
+
+
+def _validate_publication_steps(
+    steps: Sequence[PublicationStepInput],
+) -> tuple[PublicationStepInput, ...]:
+    normalized = tuple(steps)
+    if not normalized:
+        return ()
+    if any(not isinstance(step, PublicationStepInput) for step in normalized):
+        raise TypeError("publication_steps must contain PublicationStepInput values")
+    if {step.step for step in normalized} != {"topic", "translation", "source"}:
+        raise ValueError("publication_steps must contain topic, translation, and source")
+    if len(normalized) != 3:
+        raise ValueError("publication_steps must contain each step exactly once")
+
+    target_keys = {step.target_key for step in normalized}
+    if len(target_keys) != 1 or any(
+        not step.target_key.strip() or step.target_key != step.target_key.strip()
+        for step in normalized
+    ):
+        raise ValueError("publication_steps must use one non-empty target_key")
+
+    for step in normalized:
+        if step.step == "topic":
+            if (
+                step.topic_title is None
+                or not step.topic_title.strip()
+                or len(step.topic_title) > 128
+            ):
+                raise ValueError("topic publication requires a title of at most 128 characters")
+        elif step.topic_title is not None:
+            raise ValueError("comment publication steps must not contain a topic title")
+
+        if step.skipped:
+            if step.step != "source" or step.markdown_snapshot is not None:
+                raise ValueError("only an empty source publication step may be skipped")
+        elif (
+            step.markdown_snapshot is None
+            or not step.markdown_snapshot.strip()
+        ):
+            raise ValueError("non-skipped publication steps require Markdown content")
+    return normalized
+
+
+def _validate_publication_request_metadata(
+    request_metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(request_metadata, dict):
+        raise ValueError("publication claims require request metadata")
+    portal_target = request_metadata.get("portal_target")
+    if not isinstance(portal_target, dict) or set(portal_target) != {
+        "origin",
+        "user_id",
+        "category_id",
+        "category_name",
+        "username",
+    }:
+        raise ValueError("publication claims require a complete portal_target")
+
+    for field in ("origin", "user_id", "category_name", "username"):
+        value = portal_target[field]
+        if not isinstance(value, str) or not value.strip() or value != value.strip():
+            raise ValueError(f"portal_target.{field} must be a non-empty trimmed string")
+    category_id = portal_target["category_id"]
+    if isinstance(category_id, bool) or not isinstance(category_id, int) or category_id <= 0:
+        raise ValueError("portal_target.category_id must be a positive integer")
+    return request_metadata
 
 
 def _json(value: object) -> str:

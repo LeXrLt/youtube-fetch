@@ -12,8 +12,10 @@ from yt_dlp.utils import DownloadError
 
 from agent import CodexStructuredAgent
 from analysis import AnalysisEngine
+from codex_sessions import CodexSessionCleanupError, cleanup_historical_agent_sessions
 from config import DEFAULT_CONFIG_PATH, RuntimeSettings, load_settings
 from database import PipelineAlreadyRunningError, PipelineRepository
+from publishing import BbsPublisher
 from service import PipelineService
 from youtube import YoutubeClient, YoutubeMetadataError
 
@@ -125,6 +127,7 @@ def _service(settings: RuntimeSettings, repository: PipelineRepository) -> Pipel
         repository,
         YoutubeClient(settings.youtube),
         AnalysisEngine(settings, agent),
+        BbsPublisher(repository),
     )
 
 
@@ -144,6 +147,37 @@ def _max_videos_per_channel(
 
 def _results_exit_code(results: list[object]) -> int:
     return 1 if any(getattr(result, "status", None) == "failed" for result in results) else 0
+
+
+async def _cleanup_historical_sessions(settings: RuntimeSettings) -> None:
+    if not settings.agent.cleanup_historical_sessions:
+        return
+
+    try:
+        result = await cleanup_historical_agent_sessions(
+            codex_path=settings.agent.codex_path,
+            timeout_seconds=settings.agent.session_cleanup_timeout_seconds,
+        )
+    except CodexSessionCleanupError:
+        LOGGER.warning("Historical Codex session cleanup failed; continuing analysis")
+        return
+
+    log_cleanup_result = LOGGER.warning if result.failed_thread_ids else LOGGER.info
+    log_cleanup_result(
+        "Historical Codex session cleanup completed: "
+        "scanned=%d matched=%d deleted=%d already_missing=%d "
+        "skipped_live=%d skipped_loaded=%d skipped_descendant=%d "
+        "unverified=%d failed=%d",
+        result.scanned_threads,
+        result.matched_threads,
+        result.deleted_threads,
+        result.already_missing_threads,
+        result.skipped_live_threads,
+        result.skipped_loaded_threads,
+        result.skipped_descendant_threads,
+        result.unverified_threads,
+        len(result.failed_thread_ids),
+    )
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -196,6 +230,7 @@ async def _run(args: argparse.Namespace) -> int:
             if args.limit < 0:
                 raise ValueError("limit must not be negative")
             async with repository.process_lock("analysis"):
+                await _cleanup_historical_sessions(settings)
                 results = await service.analyze_pending(
                     max_videos=args.limit or None,
                     force=args.force,
@@ -213,6 +248,7 @@ async def _run(args: argparse.Namespace) -> int:
             result = download_result
             if download_result.youtube_video_id is not None:
                 async with repository.process_lock("analysis"):
+                    await _cleanup_historical_sessions(settings)
                     result = await service.analyze_video(
                         download_result.youtube_video_id,
                         force=args.force,
@@ -231,6 +267,7 @@ async def _run(args: argparse.Namespace) -> int:
                     )
                 )
             async with repository.process_lock("analysis"):
+                await _cleanup_historical_sessions(settings)
                 results.extend(
                     await service.analyze_pending(max_videos=None, force=args.force)
                 )

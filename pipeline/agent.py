@@ -20,6 +20,7 @@ from codex_sdk import (
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
+from codex_sessions import AGENT_SESSION_ORIGINATOR, AGENT_WORKSPACE_PREFIX
 from config import AgentSettings
 from models import AgentInvocation, AgentResponse
 
@@ -94,9 +95,13 @@ class StructuredAgent(Protocol):
 class CodexStructuredAgent:
     def __init__(self, settings: AgentSettings) -> None:
         self._settings = settings
-        self._workspace = tempfile.TemporaryDirectory(prefix="youtube-fetch-codex-")
+        self._workspace = tempfile.TemporaryDirectory(prefix=AGENT_WORKSPACE_PREFIX)
         self._working_directory = self._workspace.name
         options: dict[str, Any] = {
+            "env": {
+                **os.environ,
+                "CODEX_INTERNAL_ORIGINATOR_OVERRIDE": AGENT_SESSION_ORIGINATOR,
+            },
             "config": {
                 "features": _DISABLED_AGENT_FEATURES,
                 "mcp_servers": _disabled_mcp_servers(),

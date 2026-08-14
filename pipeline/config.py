@@ -85,6 +85,8 @@ class AgentSettings(BaseModel):
     reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] = "medium"
     analysis_web_search: Literal["disabled", "cached", "live"] = "live"
     turn_timeout_seconds: float = Field(default=600, gt=0)
+    cleanup_historical_sessions: bool = True
+    session_cleanup_timeout_seconds: float = Field(default=300, gt=0)
     translation_chunk_chars: int = Field(default=12000, ge=1000)
     analysis_input_max_chars: int = Field(default=180000, ge=10000)
     prompt_file: Path

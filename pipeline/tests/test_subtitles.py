@@ -8,6 +8,7 @@ from subtitles import (
     SubtitleParseError,
     SubtitleSelector,
     is_chinese_language,
+    is_simplified_chinese_language,
     normalize_subtitle,
 )
 
@@ -141,3 +142,13 @@ def test_normalize_rejects_empty_subtitle() -> None:
 @pytest.mark.parametrize("language", ["zh", "zh-Hans", "ZH-tw"])
 def test_is_chinese_language(language: str) -> None:
     assert is_chinese_language(language)
+
+
+@pytest.mark.parametrize("language", ["zh", "zh-Hans", "ZH_cn", "zh-SG"])
+def test_is_simplified_chinese_language(language: str) -> None:
+    assert is_simplified_chinese_language(language)
+
+
+@pytest.mark.parametrize("language", ["zh-Hant", "zh-TW", "zh-HK", "en"])
+def test_is_not_simplified_chinese_language(language: str) -> None:
+    assert not is_simplified_chinese_language(language)

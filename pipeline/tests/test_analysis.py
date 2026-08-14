@@ -161,7 +161,7 @@ def test_resolve_json_pointer_supports_escaped_tokens_and_arrays() -> None:
 
 
 @pytest.mark.asyncio
-async def test_chinese_subtitle_is_copied_without_agent() -> None:
+async def test_simplified_chinese_subtitle_is_copied_without_agent() -> None:
     settings = await load_settings()
     fake = FakeAgent([])
     engine = AnalysisEngine(settings, fake)
@@ -172,16 +172,30 @@ async def test_chinese_subtitle_is_copied_without_agent() -> None:
         saved.append(invocation)
 
     result = await engine.translate(
-        "zh-Hant",
+        "zh-CN",
         "原始中文字幕",
         invocation_sink=save,
     )
 
     assert result.translated_text == "原始中文字幕"
-    assert result.translated_language_code == "zh-Hant"
+    assert result.translated_language_code == "zh-CN"
     assert result.metadata["mode"] == "copied_chinese_source"
     assert fake.calls == []
     assert saved == []
+
+
+@pytest.mark.asyncio
+async def test_traditional_chinese_subtitle_is_translated_to_simplified() -> None:
+    settings = await load_settings()
+    fake = FakeAgent([{"translated_text": "简体中文字幕"}])
+    engine = AnalysisEngine(settings, fake)
+
+    result = await engine.translate("zh-Hant", "繁體中文字幕")
+
+    assert result.translated_text == "简体中文字幕"
+    assert result.translated_language_code == "zh-Hans"
+    assert result.metadata["mode"] == "codex_translation"
+    assert len(fake.calls) == 1
 
 
 @pytest.mark.asyncio

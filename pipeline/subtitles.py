@@ -112,8 +112,13 @@ def normalize_subtitle(raw_text: str, source_format: str) -> str:
 
 
 def is_chinese_language(language_code: str) -> bool:
-    normalized = language_code.casefold()
+    normalized = language_code.strip().replace("_", "-").casefold()
     return normalized == "zh" or normalized.startswith("zh-")
+
+
+def is_simplified_chinese_language(language_code: str) -> bool:
+    normalized = language_code.strip().replace("_", "-").casefold()
+    return normalized in {"zh", "zh-hans", "zh-cn", "zh-sg"}
 
 
 def _is_auto_translated_url(url: str | None) -> bool:

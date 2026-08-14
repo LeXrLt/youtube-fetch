@@ -17,6 +17,7 @@ from agent import (
     AgentOutputError,
     CodexStructuredAgent,
 )
+from codex_sessions import AGENT_SESSION_ORIGINATOR
 
 
 class FakeCodex:
@@ -115,6 +116,8 @@ def test_codex_agent_disables_execution_and_configured_mcp_tools(
         encoding="utf-8",
     )
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("PIPELINE_TEST_INHERITED_ENV", "preserved")
+    monkeypatch.setenv("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "foreign-originator")
     monkeypatch.setattr(agent_module, "Codex", FakeCodex)
 
     agent = CodexStructuredAgent(SimpleNamespace(codex_path=""))  # type: ignore[arg-type]
@@ -125,6 +128,12 @@ def test_codex_agent_disables_execution_and_configured_mcp_tools(
         assert config["features"]["unified_exec"] is False
         assert config["features"]["plugins"] is False
         assert config["mcp_servers"] == {"local_tools": {"enabled": False}}
+        environment = FakeCodex.options["env"]
+        assert environment["PIPELINE_TEST_INHERITED_ENV"] == "preserved"
+        assert (
+            environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"]
+            == AGENT_SESSION_ORIGINATOR
+        )
         assert Path(agent._working_directory).is_dir()
         assert not Path(agent._working_directory).is_relative_to(Path.cwd())
     finally:

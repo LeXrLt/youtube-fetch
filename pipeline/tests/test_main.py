@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -112,10 +114,16 @@ def _patch_runtime(
     events: list[str],
     *,
     default_max_videos: int = 0,
+    cleanup_enabled: bool = True,
 ) -> FakeService:
     settings = SimpleNamespace(
         database=object(),
         youtube=SimpleNamespace(max_videos_per_channel=default_max_videos),
+        agent=SimpleNamespace(
+            cleanup_historical_sessions=cleanup_enabled,
+            codex_path="/usr/bin/codex-test",
+            session_cleanup_timeout_seconds=123,
+        ),
     )
     repository = FakeRepository(events)
     service = FakeService(events)
@@ -137,10 +145,35 @@ def _patch_runtime(
         events.append("service")
         return service
 
+    async def cleanup_sessions(
+        *,
+        codex_path: str,
+        timeout_seconds: float,
+    ) -> SimpleNamespace:
+        assert codex_path == "/usr/bin/codex-test"
+        assert timeout_seconds == 123
+        events.append("cleanup")
+        return SimpleNamespace(
+            scanned_threads=5,
+            matched_threads=2,
+            deleted_threads=1,
+            already_missing_threads=0,
+            skipped_live_threads=1,
+            skipped_loaded_threads=1,
+            skipped_descendant_threads=0,
+            unverified_threads=1,
+            failed_thread_ids=(),
+        )
+
     monkeypatch.setattr(main_module, "load_settings", load_settings)
     monkeypatch.setattr(main_module, "_migrate", migrate)
     monkeypatch.setattr(main_module, "PipelineRepository", lambda database: repository)
     monkeypatch.setattr(main_module, "_service", create_service)
+    monkeypatch.setattr(
+        main_module,
+        "cleanup_historical_agent_sessions",
+        cleanup_sessions,
+    )
     return service
 
 
@@ -178,6 +211,7 @@ async def test_run_finishes_all_downloads_before_analysis(
         "download_channels:end",
         "lock:download:exit",
         "lock:analysis:enter",
+        "cleanup",
         "analyze_pending:None:True",
         "lock:analysis:exit",
         "close",
@@ -241,6 +275,7 @@ async def test_analyze_uses_only_analysis_lock_and_limit(
         "connect",
         "service",
         "lock:analysis:enter",
+        "cleanup",
         "analyze_pending:3:True",
         "lock:analysis:exit",
         "close",
@@ -277,6 +312,7 @@ async def test_video_uses_separate_stage_locks_and_keeps_object_output(
         f"download_video:{video_url}:None:True",
         "lock:download:exit",
         "lock:analysis:enter",
+        "cleanup",
         "analyze_video:video-id:True",
         "lock:analysis:exit",
         "close",
@@ -310,6 +346,135 @@ async def test_channel_add_does_not_take_process_lock(
         "channel-add:@example:Example",
         "close",
     ]
+
+
+@pytest.mark.asyncio
+async def test_disabled_session_cleanup_does_not_call_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _patch_runtime(monkeypatch, events, cleanup_enabled=False)
+
+    exit_code = await main_module._run(
+        main_module._parser().parse_args(["analyze"])
+    )
+
+    assert exit_code == 0
+    assert events == [
+        "migrate",
+        "connect",
+        "service",
+        "lock:analysis:enter",
+        "analyze_pending:None:False",
+        "lock:analysis:exit",
+        "close",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_cleanup_failure_warns_and_continues_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[str] = []
+    _patch_runtime(monkeypatch, events)
+
+    async def fail_cleanup(**kwargs: Any) -> None:
+        del kwargs
+        events.append("cleanup-failed")
+        raise main_module.CodexSessionCleanupError("cleanup unavailable")
+
+    monkeypatch.setattr(main_module, "cleanup_historical_agent_sessions", fail_cleanup)
+
+    with caplog.at_level(logging.WARNING, logger=main_module.__name__):
+        exit_code = await main_module._run(
+            main_module._parser().parse_args(["analyze"])
+        )
+
+    assert exit_code == 0
+    assert events == [
+        "migrate",
+        "connect",
+        "service",
+        "lock:analysis:enter",
+        "cleanup-failed",
+        "analyze_pending:None:False",
+        "lock:analysis:exit",
+        "close",
+    ]
+    assert "cleanup failed; continuing analysis" in caplog.text
+    assert "cleanup unavailable" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_session_cleanup_cancellation_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _patch_runtime(monkeypatch, events)
+
+    async def cancel_cleanup(**kwargs: Any) -> None:
+        del kwargs
+        events.append("cleanup-cancelled")
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main_module, "cleanup_historical_agent_sessions", cancel_cleanup)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main_module._run(main_module._parser().parse_args(["analyze"]))
+
+    assert events == [
+        "migrate",
+        "connect",
+        "service",
+        "lock:analysis:enter",
+        "cleanup-cancelled",
+        "lock:analysis:exit",
+        "close",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_cleanup_success_log_contains_counts_but_not_thread_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = SimpleNamespace(
+        agent=SimpleNamespace(
+            cleanup_historical_sessions=True,
+            codex_path="codex",
+            session_cleanup_timeout_seconds=300,
+        )
+    )
+
+    async def cleanup_sessions(**kwargs: Any) -> SimpleNamespace:
+        del kwargs
+        return SimpleNamespace(
+            scanned_threads=8,
+            matched_threads=3,
+            deleted_threads=1,
+            already_missing_threads=1,
+            skipped_live_threads=1,
+            skipped_loaded_threads=1,
+            skipped_descendant_threads=1,
+            unverified_threads=1,
+            failed_thread_ids=("sensitive-thread-id",),
+        )
+
+    monkeypatch.setattr(
+        main_module,
+        "cleanup_historical_agent_sessions",
+        cleanup_sessions,
+    )
+
+    with caplog.at_level(logging.INFO, logger=main_module.__name__):
+        await main_module._cleanup_historical_sessions(settings)
+
+    assert "scanned=8 matched=3 deleted=1" in caplog.text
+    assert "skipped_descendant=1" in caplog.text
+    assert "failed=1" in caplog.text
+    assert "sensitive-thread-id" not in caplog.text
+    assert caplog.records[-1].levelno == logging.WARNING
 
 
 @pytest.mark.parametrize(

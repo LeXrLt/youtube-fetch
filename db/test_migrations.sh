@@ -362,11 +362,116 @@ translation_backfill_valid="$(
 )"
 [ "$translation_backfill_valid" = "1" ]
 
-if "${PSQL_TEST[@]}" >/dev/null 2>&1 <<'SQL'
+"${PSQL_TEST[@]}" >/dev/null <<'SQL'
+INSERT INTO analysis_runs(
+  id,
+  status,
+  video_id,
+  subtitle_track_id,
+  metadata
+)
+SELECT
+  input.id,
+  'succeeded',
+  subtitle.video_id,
+  subtitle.id,
+  input.metadata
+FROM subtitle_tracks AS subtitle
+CROSS JOIN LATERAL (
+  VALUES
+    (
+      '00000000-0000-0000-0000-000000000015'::uuid,
+      jsonb_build_object('translation', subtitle.translation_metadata)
+    ),
+    (
+      '00000000-0000-0000-0000-000000000016'::uuid,
+      '{"translation": {"mode": "different-revision"}}'::jsonb
+    )
+) AS input(id, metadata)
+WHERE subtitle.id = '00000000-0000-0000-0000-000000000006';
+
+INSERT INTO video_analyses(
+  id,
+  video_id,
+  subtitle_track_id,
+  analysis_run_id,
+  translated_subtitle_snapshot
+)
+VALUES
+  (
+    '00000000-0000-0000-0000-000000000013',
+    '00000000-0000-0000-0000-000000000004',
+    '00000000-0000-0000-0000-000000000006',
+    '00000000-0000-0000-0000-000000000015',
+    'Temporary snapshot before migration replay'
+  ),
+  (
+    '00000000-0000-0000-0000-000000000014',
+    '00000000-0000-0000-0000-000000000004',
+    '00000000-0000-0000-0000-000000000006',
+    '00000000-0000-0000-0000-000000000016',
+    'Temporary snapshot before migration replay'
+  ),
+  (
+    '00000000-0000-0000-0000-000000000018',
+    '00000000-0000-0000-0000-000000000004',
+    '00000000-0000-0000-0000-000000000006',
+    NULL,
+    'Temporary snapshot before migration replay'
+  );
+
+DROP TRIGGER video_analyses_translation_snapshot_guard ON video_analyses;
+DROP FUNCTION enforce_video_analysis_translation_snapshot();
+DROP INDEX idx_video_analyses_publication_fifo;
+ALTER TABLE video_analyses DROP COLUMN translated_subtitle_snapshot;
+SQL
+
+"${PSQL_TEST[@]}" \
+  --file "$ROOT_DIR/db/migrations/014_analysis_translation_snapshot.sql" \
+  >/dev/null
+
+analysis_snapshot_backfill_valid="$(
+  "${PSQL_TEST[@]}" --tuples-only --no-align --command \
+    "SELECT (
+      (SELECT translated_subtitle_snapshot = 'Backfill normalized source'
+       FROM video_analyses
+       WHERE id = '00000000-0000-0000-0000-000000000013')
+      AND
+      (SELECT translated_subtitle_snapshot IS NULL
+       FROM video_analyses
+       WHERE id = '00000000-0000-0000-0000-000000000014')
+      AND
+      (SELECT translated_subtitle_snapshot IS NULL
+       FROM video_analyses
+       WHERE id = '00000000-0000-0000-0000-000000000018')
+    )::integer;"
+)"
+[ "$analysis_snapshot_backfill_valid" = "1" ]
+
+assert_sql_rejected "New analysis without a translated subtitle snapshot was not rejected" <<'SQL'
 INSERT INTO video_analyses(video_id, subtitle_track_id)
 VALUES (
+  '00000000-0000-0000-0000-000000000004',
+  '00000000-0000-0000-0000-000000000006'
+);
+SQL
+
+assert_sql_rejected "Analysis translated subtitle snapshot mutation was not rejected" <<'SQL'
+UPDATE video_analyses
+SET translated_subtitle_snapshot = 'Mutated translated subtitle'
+WHERE id = '00000000-0000-0000-0000-000000000013';
+SQL
+
+if "${PSQL_TEST[@]}" >/dev/null 2>&1 <<'SQL'
+INSERT INTO video_analyses(
+  video_id,
+  subtitle_track_id,
+  translated_subtitle_snapshot
+)
+VALUES (
   '00000000-0000-0000-0000-000000000003',
-  '00000000-0000-0000-0000-000000000005'
+  '00000000-0000-0000-0000-000000000005',
+  'Cross-video translated subtitle'
 );
 SQL
 then
@@ -375,11 +480,17 @@ then
 fi
 
 "${PSQL_TEST[@]}" >/dev/null <<'SQL'
-INSERT INTO video_analyses(id, video_id, subtitle_track_id)
+INSERT INTO video_analyses(
+  id,
+  video_id,
+  subtitle_track_id,
+  translated_subtitle_snapshot
+)
 VALUES (
   '00000000-0000-0000-0000-000000000012',
   '00000000-0000-0000-0000-000000000004',
-  '00000000-0000-0000-0000-000000000005'
+  '00000000-0000-0000-0000-000000000005',
+  'Migration publication translated subtitle'
 );
 
 DELETE FROM subtitle_tracks
@@ -388,7 +499,9 @@ SQL
 
 cleared_reference="$(
   "${PSQL_TEST[@]}" --tuples-only --no-align --command \
-    "SELECT (subtitle_track_id IS NULL)::integer FROM video_analyses WHERE video_id = '00000000-0000-0000-0000-000000000004';"
+    "SELECT (subtitle_track_id IS NULL)::integer
+     FROM video_analyses
+     WHERE id = '00000000-0000-0000-0000-000000000012';"
 )"
 [ "$cleared_reference" = "1" ]
 

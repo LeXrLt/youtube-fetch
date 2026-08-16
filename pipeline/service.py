@@ -5,7 +5,7 @@ import hashlib
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 from uuid import UUID
 
 from analysis import AnalysisEngine
@@ -13,11 +13,9 @@ from config import RuntimeSettings
 from database import PipelineRepository
 from models import (
     AgentInvocation,
-    AnalysisOutcome,
     ChannelRecord,
     FetchedVideo,
     ProcessResult,
-    PublicationStepInput,
     StoredVideo,
     SubtitleDownloadStatus,
     SubtitleDownloadTask,
@@ -28,19 +26,6 @@ from subtitles import is_simplified_chinese_language
 from youtube import YoutubeClient
 
 LOGGER = logging.getLogger(__name__)
-
-
-class PublicationPublisher(Protocol):
-    target_key: str
-
-    def build_steps(
-        self,
-        fetched: FetchedVideo,
-        translation: TranslationResult,
-        outcome: AnalysisOutcome,
-    ) -> Sequence[PublicationStepInput]: ...
-
-    async def publish(self, video_analysis_id: UUID) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,13 +44,11 @@ class PipelineService:
         repository: PipelineRepository,
         youtube: YoutubeClient,
         analysis: AnalysisEngine,
-        publisher: PublicationPublisher | None = None,
     ) -> None:
         self._settings = settings
         self._repository = repository
         self._youtube = youtube
         self._analysis = analysis
-        self._publisher = publisher
 
     async def add_channel(self, channel_url: str, researcher_name: str | None) -> UUID:
         channel = await self._youtube.inspect_channel(channel_url)
@@ -207,23 +190,6 @@ class PipelineService:
         stored_translation: TranslationResult | None,
         force: bool,
     ) -> ProcessResult:
-        if self._publisher is not None:
-            pending_publication_id = (
-                await self._repository.get_pending_publication_analysis_id(
-                    video_id,
-                    self._publisher.target_key,
-                )
-            )
-            if pending_publication_id is not None and await self._publisher.publish(
-                pending_publication_id
-            ):
-                return ProcessResult(
-                    video_url=video_url,
-                    youtube_video_id=fetched.metadata.youtube_video_id,
-                    status="published",
-                    detail="Existing analysis publication completed",
-                )
-
         if fetched.subtitle is None or subtitle_id is None:
             return ProcessResult(
                 video_url=video_url,
@@ -255,11 +221,6 @@ class PipelineService:
         ).hexdigest()
         matching_analysis_id = None
         if not force:
-            publication_options = (
-                {"publication_target_key": self._publisher.target_key}
-                if self._publisher is not None
-                else {}
-            )
             matching_analysis_id = await self._repository.get_matching_analysis_id(
                 video_id,
                 subtitle_id,
@@ -270,21 +231,13 @@ class PipelineService:
                 translation_schema_sha256=self._settings.translation_schema_sha256,
                 schema_sha256=self._settings.analysis_schema_sha256,
                 source_sha256=source_sha256,
-                **publication_options,
             )
         if matching_analysis_id is not None:
-            publication_resumed = False
-            if self._publisher is not None:
-                publication_resumed = await self._publisher.publish(matching_analysis_id)
             return ProcessResult(
                 video_url=video_url,
                 youtube_video_id=fetched.metadata.youtube_video_id,
-                status="published" if publication_resumed else "skipped",
-                detail=(
-                    "Existing analysis publication completed"
-                    if publication_resumed
-                    else "Matching analysis already exists"
-                ),
+                status="skipped",
+                detail="Matching analysis already exists",
             )
 
         initial_metadata = {
@@ -331,18 +284,7 @@ class PipelineService:
                 "translation": translation.metadata,
                 "analysis": outcome.metadata,
             }
-            publication_options = (
-                {
-                    "publication_steps": self._publisher.build_steps(
-                        fetched,
-                        translation,
-                        outcome,
-                    )
-                }
-                if self._publisher is not None
-                else {}
-            )
-            analysis_id = await self._repository.complete_analysis_run(
+            await self._repository.complete_analysis_run(
                 run_id,
                 video_id,
                 subtitle_id,
@@ -350,7 +292,7 @@ class PipelineService:
                 profile_name=self._settings.agent.profile_name,
                 schema_version=self._settings.agent.schema_version,
                 run_metadata=run_metadata,
-                **publication_options,
+                translated_subtitle=translation.translated_text,
             )
         except asyncio.CancelledError:
             await asyncio.shield(
@@ -364,9 +306,6 @@ class PipelineService:
         except Exception as exc:
             await self._repository.fail_analysis_run(run_id, str(exc), failure_metadata)
             raise
-
-        if self._publisher is not None:
-            await self._publisher.publish(analysis_id)
 
         return ProcessResult(
             video_url=video_url,
@@ -417,11 +356,6 @@ class PipelineService:
         max_videos: int | None,
         force: bool,
     ) -> list[ProcessResult]:
-        publication_options = (
-            {"publication_target_key": self._publisher.target_key}
-            if self._publisher is not None
-            else {}
-        )
         references = await self._repository.list_analysis_candidates(
             profile_name=self._settings.agent.profile_name,
             schema_version=self._settings.agent.schema_version,
@@ -431,7 +365,6 @@ class PipelineService:
             schema_sha256=self._settings.analysis_schema_sha256,
             force=force,
             limit=max_videos,
-            **publication_options,
         )
         results: list[ProcessResult] = []
         for reference in references:
@@ -443,7 +376,7 @@ class PipelineService:
                     )
                 )
             except Exception as exc:
-                LOGGER.exception("Failed to analyze or publish %s", reference.video_url)
+                LOGGER.exception("Failed to analyze %s", reference.video_url)
                 results.append(
                     ProcessResult(
                         video_url=reference.video_url,

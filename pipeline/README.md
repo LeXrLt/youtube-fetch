@@ -114,9 +114,10 @@ pipeline/.venv/bin/python pipeline/main.py channel-inspect '@example'
 其他数据库相关命令在执行业务操作前都会自动运行 `db/migrate.sh`；迁移失败时业务操作
 不会开始。
 
-抓取和分析使用两把 PostgreSQL 会话级 advisory lock。同一个项目数据库同一时间最多运行
-一个下载阶段和一个分析阶段，但下载与分析可彼此并行。`download`、`analyze` 分别持有对应
-锁；`run` 和 `video` 依次持有下载锁、释放，再持有分析锁，不会同时占用两把锁。同类锁被
+下载、分析和发布使用三把独立的 PostgreSQL 会话级 advisory lock。同一个项目数据库
+同一时间最多运行一个下载、一个分析和一个发布进程，三个阶段可彼此并行。
+`download`、`analyze`、`push` 分别持有对应锁；`run` 和 `video` 依次持有下载锁、释放，再持有
+分析锁，不会获取发布锁。同类锁被
 其他进程持有时，新任务立即退出而不排队；连接关闭时 PostgreSQL 自动释放锁。
 下载任务被取消时会先等待正在运行的 yt-dlp 工作线程结束，再释放并发配额和下载锁。
 `config-check`、`migrate`、`channel-inspect` 和 `channel-add` 不占用阶段锁。
@@ -159,6 +160,9 @@ pipeline/.venv/bin/python pipeline/main.py download
 # 只分析 PostgreSQL 中的待处理字幕，不访问 YouTube；0 表示不限量
 pipeline/.venv/bin/python pipeline/main.py analyze --limit 20
 
+# 从成功分析中消费待发布任务；0 表示不限量
+pipeline/.venv/bin/python pipeline/main.py push --limit 20
+
 # 兼容的一体化命令：全部频道下载完成后，再分析当前全部待处理字幕
 pipeline/.venv/bin/python pipeline/main.py run
 
@@ -171,9 +175,10 @@ pipeline/.venv/bin/python pipeline/main.py run \
 pipeline/.venv/bin/python pipeline/main.py download --max-videos-per-channel 5
 ```
 
-生产环境建议把两个阶段配置成独立调度任务，例如高频运行 `download`，并按机器可承受的
-Codex 负载运行 `analyze --limit N`。两条命令可以同时执行；分析命令启动时会固定本轮候选
-视频集合，新加入的视频由下一轮处理。若候选视频在轮到分析前被 `download --force` 写入
+生产环境建议把三个阶段配置成独立调度任务，例如高频运行 `download`，按机器可承受的
+Codex 负载运行 `analyze --limit N`，再独立运行 `push --limit N`。三条命令可以同时执行；
+分析和发布命令启动时会分别固定本轮候选快照，新加入的视频或 analysis revision 由下一轮处理。
+若分析候选视频在轮到执行前被 `download --force` 写入
 新版字幕，本轮会读取执行时的最新版本，完整身份校验仍会防止错误复用。下载已入库后即形成
 恢复边界，即使分析失败、被取消或因分析锁竞争而未启动，后续 `analyze` 仍会从 PostgreSQL
 继续，不必重新抓取。
@@ -196,10 +201,13 @@ pipeline/.venv/bin/python pipeline/main.py analyze --limit 20 --force
 
 ## BBS 发布与恢复
 
-`analyze`、`run` 和 `video` 在生成分析时会触发 BBS 发布；`download` 不会。翻译和分析
-完成后，`complete_analysis_run` 先在同一数据库事务中提交成功的 analysis revision 以及
-`topic`、`translation`、`source` 三步 outbox 快照，事务成功后才向 bbs-go 的 `Youtube`
-分类发送 Markdown。主题正文包含视频信息和 AI 分析，第一条一级评论为中文翻译，第二条
+`analyze`、`run` 和 `video` 只提交成功的 analysis revision，不访问 BBS。分析事务同时把当次
+简体中文翻译保存为 `video_analyses.translated_subtitle_snapshot` 不可变快照，后续字幕翻译更新不会
+改变该 revision 的发布内容。只有独立 `push` 命令会访问 bbs-go：它按成功分析的先后顺序消费，
+每次启动只处理单次数据库查询得到的有限快照，不会追赶运行期间并发写入的新 revision；
+并在首次消费时从已持久化的分析、翻译快照、原字幕和视频元数据构建 `topic`、`translation`、
+`source` 三步不可变 outbox，再依次执行。主题正文以摘要开头，然后是视频信息和 AI 分析；
+第一条一级评论为中文翻译，第二条
 一级评论为原文字幕。源语言去除首尾空白、将下划线规范化为连字符并忽略大小写后，只有
 `zh`、`zh-Hans`、`zh-CN`、`zh-SG` 被视为简体中文；这些语言跳过原文评论，其他语言包括
 繁体中文先由 Agent 翻译为简体中文，并继续发布繁体原文评论。
@@ -209,7 +217,9 @@ pipeline/.venv/bin/python pipeline/main.py analyze --limit 20 --force
 明确失败且可确认未写入的步骤可恢复执行。
 GET 读取允许有限重试，但创建主题和评论的 POST 不自动重试，因为它们不是幂等操作。如果
 真正开始 POST 后发生进程中断、请求传输失败或响应不可判定，步骤会标记为 `uncertain`，后续运行停止自动发布；
-必须先人工核对远程站点是否已产生主题或评论，再处理数据库状态。该机制用于断点恢复和降低
+该 revision 会作为失败诊断输出并使命令返回非零，但不占正数 `--limit` 的新发布额度；同视频
+后续 revision 继续阻塞，其他视频仍可处理。必须先人工核对远程站点是否已产生主题或评论，
+再处理数据库状态。该机制用于断点恢复和降低
 重复风险，不提供 exactly-once 保证。
 
 门户请求只通过 `curl` 发出，并禁用用户级 `.curlrc`、重定向和跨协议请求；认证 Header 位于
@@ -217,10 +227,16 @@ GET 读取允许有限重试，但创建主题和评论的 POST 不自动重试�
 立即删除。模型生成的分析字段按纯文本写入 Markdown，参考链接只接受 HTTP(S)，避免字幕
 提示注入产生可执行 HTML。
 
-功能上线前已经成功完成、因而没有 `bbs_publication_steps` 快照的历史分析不会自动回填。
-普通运行会恢复当前匹配 analysis revision 的未完成发布；使用 `--force` 创建的新 revision
-拥有自己独立的三步快照并各自发布，可能因此产生新的 BBS 主题。只要同一视频和目标存在
-`uncertain` 步骤，`--force` 也不会创建或发布新 revision，必须先完成人工核对。
+主题标题格式为“原语言嘉宾姓名（简体中文身份）｜频道｜YYYY-MM-DD”。多嘉宾按分析结果中的
+主嘉宾优先、其次首次出现顺序排列；无嘉宾时回退到原视频标题。嘉宾身份无法核实时使用
+“身份未核实”，缺频道或发布日期时分别使用“频道未知”、“日期未知”，并在 128 字符限制内截断。
+
+迁移 `014_analysis_translation_snapshot.sql` 会尝试为历史成功分析回填翻译快照，但只有当该 run
+保存的翻译元数据与当前字幕翻译元数据一致时才能可靠回填。缺少快照、无法可靠重建的历史
+revision，以及缺少结构化 `guests` 的旧分析，不会首次入队；需要用当前 analysis prompt v3 和
+`schema_version = "2"` 重新分析，新 revision 才会被 `push` 首次入队。升级前已存在的未完成
+outbox 仍会恢复，不受上述首次入队条件限制。同一视频和目标存在 `uncertain` 步骤时，后续 revision
+也会被阻塞，必须先完成人工核对。
 
 未指定 `--channel` 时，`download` 和 `run` 从 PostgreSQL 的 `youtube_channels` 表读取
 `is_active = true` 的频道；不会读取或同步 Cookie 登录用户的订阅列表。Web 管理页新增或
@@ -270,9 +286,11 @@ revision 的视频。失败或取消的分析可在下一轮恢复。
 `run` 保留原参数，但执行顺序固定为“完成所有频道下载，再分析整个数据库的当前候选列表”，
 其 JSON 结果是两个阶段结果组成的扁平列表。`--channel` 和
 `--max-videos-per-channel` 只约束下载阶段，不限制随后启动的全局分析数量；需要控制 Codex
-工作量时应改用独立的 `analyze --limit N`。任一阶段出现 `failed` 时进程退出码为 1；单个
+工作量时应改用独立的 `analyze --limit N`。`push --limit N` 限制本轮可自动推进的新发布候选，
+已有 `uncertain`/遗留 `in_progress` 诊断可能使 JSON 结果数大于 N。任一阶段出现 `failed` 时进程退出码为 1；单个
 视频或频道失败不会取消同阶段的其他任务。正数 `--max-videos-per-channel` 会分批推进首次
-回填，并只在确认 Uploads playlist 已耗尽后标记完成。`analyze --limit 0` 表示不限量，所有
+回填，并只在确认 Uploads playlist 已耗尽后标记完成。`analyze --limit 0` 和 `push --limit 0`
+都表示不限量，所有
 数量限制都拒绝负数。
 
 该队列状态由 `011_subtitle_download_status.sql` 添加；Pipeline 业务命令启动时会自动执行
@@ -285,6 +303,10 @@ revision 的视频。失败或取消的分析可在下一轮恢复。
 `013_bbs_publication_steps.sql` 增加不可变的 BBS Markdown outbox 快照、逐步状态、远程 ID、
 请求/响应元数据和恢复索引。Pipeline 业务命令会自动应用该迁移；独立部署 Web 或升级调度
 前仍须显式运行 `./db/migrate.sh`。
+
+`014_analysis_translation_snapshot.sql` 为 `video_analyses` 增加不可变的中文翻译字幕快照、
+回填可靠匹配的历史 revision，并增加按分析时间顺序消费的发布索引。新分析必须保存
+非空快照。
 
 ## 字幕选择与处理
 
@@ -307,6 +329,9 @@ revision 的视频。失败或取消的分析可在下一轮恢复。
 中文，再执行分析。
 
 ## 提示词与结构化输出
+
+当前分析提示词版本为 v3，分析 `schema_version` 为 `2`；Schema 2 增加结构化
+`guests` 以支持可验证的发布标题。
 
 - `config/prompts.toml` 保存翻译和分析模板及各自版本。
 - `config/translation.schema.json` 与 `config/analysis.schema.json` 使用 JSON Schema

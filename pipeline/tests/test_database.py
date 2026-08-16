@@ -26,6 +26,7 @@ from models import (
     AnalysisProjection,
     ChannelMetadata,
     DownloadedSubtitle,
+    PublicationCandidate,
     PublicationStepInput,
     SubtitleDownloadStatus,
     TranslationResult,
@@ -540,15 +541,17 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
                 subtitle_track_id,
                 analysis_run_id,
                 profile_name,
-                output_schema_version
+                output_schema_version,
+                translated_subtitle_snapshot
             )
-            VALUES ($1, $2, $3, $4, $5)
+            VALUES ($1, $2, $3, $4, $5, $6)
             """,
             video_id,
             subtitle_id,
             run_id,
             identity["profile_name"],
             identity["schema_version"],
+            normalized_text,
         )
         if status != "running":
             await pool.execute(
@@ -796,6 +799,300 @@ async def test_save_fetched_video_only_fills_missing_translation(
 
 
 @pytest.mark.asyncio
+async def test_repository_publication_queue_is_fifo_per_video_and_requeues_uncertain(
+    repository: PipelineRepository,
+) -> None:
+    channel = ChannelMetadata(
+        youtube_channel_id="publication-queue-channel",
+        title="Publication Queue Channel",
+        channel_url="https://www.youtube.com/@publication-queue-channel",
+    )
+    subtitle = DownloadedSubtitle(
+        language_code="en",
+        language_name="English",
+        source_format="vtt",
+        is_auto_generated=False,
+        raw_text="WEBVTT\n\nPublication queue source",
+        normalized_text="Publication queue source",
+    )
+    first_video = VideoMetadata(
+        youtube_video_id="publication-queue-first",
+        channel=channel,
+        title="First publication queue video",
+        video_url="https://www.youtube.com/watch?v=publication-queue-first",
+    )
+    second_video = replace(
+        first_video,
+        youtube_video_id="publication-queue-second",
+        title="Second publication queue video",
+        video_url="https://www.youtube.com/watch?v=publication-queue-second",
+    )
+    first_video_id, first_subtitle_id = await repository.save_fetched_video(
+        first_video,
+        subtitle,
+    )
+    second_video_id, second_subtitle_id = await repository.save_fetched_video(
+        second_video,
+        subtitle,
+    )
+    assert first_subtitle_id is not None
+    assert second_subtitle_id is not None
+    pool = repository._require_pool()
+
+    async def add_succeeded_revision(
+        video_id: UUID,
+        subtitle_id: UUID,
+        snapshot: str,
+        timestamp: datetime,
+    ) -> UUID:
+        run_id = await repository.start_analysis_run(
+            video_id,
+            subtitle_id,
+            agent_model=None,
+            prompt_version="publication-queue",
+            metadata={},
+        )
+        analysis_id = await pool.fetchval(
+            """
+            INSERT INTO video_analyses(
+                video_id,
+                subtitle_track_id,
+                analysis_run_id,
+                translated_subtitle_snapshot,
+                raw_agent_output,
+                summary,
+                analyzed_at,
+                created_at
+            )
+            VALUES (
+                $1, $2, $3, $4, '{"guests": []}'::jsonb,
+                'Publication queue summary', $5, $5
+            )
+            RETURNING id
+            """,
+            video_id,
+            subtitle_id,
+            run_id,
+            snapshot,
+            timestamp,
+        )
+        await pool.execute(
+            "UPDATE analysis_runs SET status = 'succeeded' WHERE id = $1",
+            run_id,
+        )
+        return analysis_id
+
+    first_oldest_id = await add_succeeded_revision(
+        first_video_id,
+        first_subtitle_id,
+        "First translated revision",
+        datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    first_newer_id = await add_succeeded_revision(
+        first_video_id,
+        first_subtitle_id,
+        "Second translated revision",
+        datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    second_id = await add_succeeded_revision(
+        second_video_id,
+        second_subtitle_id,
+        "Other video translated revision",
+        datetime(2026, 8, 3, tzinfo=UTC),
+    )
+    target_key = "portal-push:Youtube"
+    expected_oldest = PublicationCandidate(
+        first_oldest_id,
+        first_video.youtube_video_id,
+        first_video.video_url,
+    )
+    expected_newer = PublicationCandidate(
+        first_newer_id,
+        first_video.youtube_video_id,
+        first_video.video_url,
+    )
+    expected_second = PublicationCandidate(
+        second_id,
+        second_video.youtube_video_id,
+        second_video.video_url,
+    )
+    assert await repository.list_publication_candidates(target_key) == [
+        expected_oldest,
+        expected_newer,
+        expected_second,
+    ]
+    await pool.execute(
+        "UPDATE video_analyses SET raw_agent_output = '{}'::jsonb WHERE id = $1",
+        second_id,
+    )
+    assert await repository.list_publication_candidates("portal-push:Strict") == [
+        expected_oldest,
+        expected_newer,
+    ]
+    await pool.execute(
+        """
+        UPDATE video_analyses
+        SET raw_agent_output = '{"guests": []}'::jsonb
+        WHERE id = $1
+        """,
+        second_id,
+    )
+    await pool.execute(
+        "UPDATE video_analyses SET summary = NULL WHERE id = $1",
+        second_id,
+    )
+    assert await repository.list_publication_candidates("portal-push:Summary") == [
+        expected_oldest,
+        expected_newer,
+    ]
+    await pool.execute(
+        "UPDATE video_analyses SET summary = 'Publication queue summary' WHERE id = $1",
+        second_id,
+    )
+
+    def publication_steps(title: str) -> list[PublicationStepInput]:
+        return [
+            PublicationStepInput(target_key, "topic", title, "Analysis markdown"),
+            PublicationStepInput(
+                target_key,
+                "translation",
+                None,
+                "Translation markdown",
+            ),
+            PublicationStepInput(target_key, "source", None, None, skipped=True),
+        ]
+
+    portal_target = {
+        "origin": "https://portal.test",
+        "user_id": "publication-queue-user",
+        "category_id": 4,
+        "category_name": "Youtube",
+        "username": "publication-queue-publisher",
+    }
+    await repository.ensure_publication_steps(
+        first_oldest_id,
+        publication_steps("Oldest revision"),
+    )
+    for step, remote_topic_id, remote_comment_id in (
+        ("topic", "publication-queue-topic", None),
+        ("translation", None, 501),
+    ):
+        assert await repository.claim_publication_step(
+            first_oldest_id,
+            target_key,
+            step,
+            {"portal_target": portal_target},
+        )
+        assert await repository.mark_publication_step_in_progress(
+            first_oldest_id,
+            target_key,
+            step,
+        )
+        await repository.mark_publication_step_created(
+            first_oldest_id,
+            target_key,
+            step,
+            remote_topic_id=remote_topic_id,
+            remote_comment_id=remote_comment_id,
+            remote_status=0,
+            response_metadata={},
+        )
+        await repository.mark_publication_step_succeeded(
+            first_oldest_id,
+            target_key,
+            step,
+            remote_status=0,
+            response_metadata={},
+        )
+    assert await repository.list_publication_candidates(target_key) == [
+        expected_newer,
+        expected_second,
+    ]
+
+    await repository.ensure_publication_steps(
+        first_newer_id,
+        publication_steps("Newer revision"),
+    )
+    assert await repository.claim_publication_step(
+        first_newer_id,
+        target_key,
+        "topic",
+        {"portal_target": portal_target},
+    )
+    assert await repository.mark_publication_step_in_progress(
+        first_newer_id,
+        target_key,
+        "topic",
+    )
+    await repository.mark_publication_step_failed(
+        first_newer_id,
+        target_key,
+        "topic",
+        "remote result requires reconciliation",
+        uncertain=True,
+    )
+    expected_uncertain = replace(
+        expected_newer,
+        requires_reconciliation=True,
+    )
+    assert await repository.list_publication_candidates(target_key) == [
+        expected_uncertain,
+        expected_second,
+    ]
+
+    legacy_video = replace(
+        first_video,
+        youtube_video_id="publication-queue-legacy",
+        title="Legacy publication queue video",
+        video_url="https://www.youtube.com/watch?v=publication-queue-legacy",
+    )
+    legacy_video_id, _ = await repository.save_fetched_video(legacy_video, None)
+    await pool.execute(
+        """
+        ALTER TABLE video_analyses
+        DISABLE TRIGGER video_analyses_translation_snapshot_guard
+        """
+    )
+    try:
+        legacy_analysis_id = await pool.fetchval(
+            """
+            INSERT INTO video_analyses(video_id, analyzed_at, created_at)
+            VALUES (
+                $1,
+                '2026-07-01 00:00:00+00'::timestamptz,
+                '2026-07-01 00:00:00+00'::timestamptz
+            )
+            RETURNING id
+            """,
+            legacy_video_id,
+        )
+    finally:
+        await pool.execute(
+            """
+            ALTER TABLE video_analyses
+            ENABLE TRIGGER video_analyses_translation_snapshot_guard
+            """
+        )
+
+    legacy_target = "portal-push:Legacy"
+    legacy_steps = [
+        replace(step, target_key=legacy_target)
+        for step in publication_steps("Legacy snapshot")
+    ]
+    await repository.ensure_publication_steps(legacy_analysis_id, legacy_steps)
+    assert await repository.list_publication_candidates(legacy_target) == [
+        PublicationCandidate(
+            legacy_analysis_id,
+            legacy_video.youtube_video_id,
+            legacy_video.video_url,
+        ),
+        expected_oldest,
+        expected_newer,
+        expected_second,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_repository_persists_pipeline_artifacts_and_run_states(
     repository: PipelineRepository,
 ) -> None:
@@ -946,6 +1243,7 @@ async def test_repository_persists_pipeline_artifacts_and_run_states(
     assert saved_failure["error_message"] == "model failure"
     payload = {
         "contract_version": 3,
+        "guests": [],
         "result": {
             "summary": "A variable payload",
             "evidence": [
@@ -1027,8 +1325,10 @@ async def test_repository_persists_pipeline_artifacts_and_run_states(
         profile_name="research-v1",
         schema_version="2026-08-04",
         run_metadata=run_metadata,
-        publication_steps=publication_steps,
+        translated_subtitle=translation.translated_text,
     )
+    await repository.ensure_publication_steps(analysis_id, publication_steps)
+    await repository.ensure_publication_steps(analysis_id, publication_steps)
 
     pool = repository._require_pool()
     subtitle_row = await pool.fetchrow(
@@ -1049,7 +1349,8 @@ async def test_repository_persists_pipeline_artifacts_and_run_states(
     analysis_row = await pool.fetchrow(
         """
         SELECT raw_agent_output::text AS payload, key_points::text AS key_points,
-               analysis_metadata::text AS metadata
+               analysis_metadata::text AS metadata,
+               translated_subtitle_snapshot
         FROM video_analyses WHERE id = $1
         """,
         analysis_id,
@@ -1058,6 +1359,25 @@ async def test_repository_persists_pipeline_artifacts_and_run_states(
     assert json.loads(analysis_row["payload"]) == payload
     assert json.loads(analysis_row["key_points"]) == outcome.projection.key_points
     assert json.loads(analysis_row["metadata"]) == analysis_metadata
+    assert analysis_row["translated_subtitle_snapshot"] == translation.translated_text
+
+    with pytest.raises(asyncpg.RaiseError, match="snapshot is immutable"):
+        await pool.execute(
+            """
+            UPDATE video_analyses
+            SET translated_subtitle_snapshot = 'mutated translation'
+            WHERE id = $1
+            """,
+            analysis_id,
+        )
+    with pytest.raises(RuntimeError, match="different immutable snapshot"):
+        await repository.ensure_publication_steps(
+            analysis_id,
+            [
+                replace(publication_steps[0], topic_title="Changed title"),
+                *publication_steps[1:],
+            ],
+        )
 
     saved_steps = await repository.list_publication_steps(
         analysis_id,
@@ -1082,17 +1402,16 @@ async def test_repository_persists_pipeline_artifacts_and_run_states(
         "limit": None,
     }
     assert await repository.list_analysis_candidates(**candidate_identity) == []
-    assert await repository.list_analysis_candidates(
-        **candidate_identity,
-        publication_target_key="portal-push:Youtube",
-    ) == [VideoReference(video.youtube_video_id, video.video_url)]
-    assert (
-        await repository.get_pending_publication_analysis_id(
-            video_id,
-            "portal-push:Youtube",
-        )
-        == analysis_id
+    expected_publication_candidate = PublicationCandidate(
+        video_analysis_id=analysis_id,
+        youtube_video_id=video.youtube_video_id,
+        video_url=video.video_url,
     )
+    assert await repository.list_publication_candidates(
+        "portal-push:Youtube",
+    ) == [expected_publication_candidate]
+    with pytest.raises(ValueError, match="target_key"):
+        await repository.list_publication_candidates(" ")
 
     invalid_latest_subtitle_id = await pool.fetchval(
         """
@@ -1111,10 +1430,17 @@ async def test_repository_persists_pipeline_artifacts_and_run_states(
         video_id,
         "WEBVTT\n\ninvalid newer subtitle",
     )
-    assert await repository.list_analysis_candidates(
-        **candidate_identity,
-        publication_target_key="portal-push:Youtube",
-    ) == [VideoReference(video.youtube_video_id, video.video_url)]
+    assert await repository.list_publication_candidates(
+        "portal-push:Youtube",
+    ) == [expected_publication_candidate]
+    publication_source = await repository.get_publication_source(analysis_id)
+    assert publication_source is not None
+    assert publication_source.video_analysis_id == analysis_id
+    assert publication_source.fetched.metadata == video
+    assert publication_source.fetched.subtitle == subtitle
+    assert publication_source.translated_text == translation.translated_text
+    assert publication_source.outcome == outcome
+    assert await repository.get_publication_source(UUID(int=0)) is None
     await pool.execute(
         "DELETE FROM subtitle_tracks WHERE id = $1",
         invalid_latest_subtitle_id,
@@ -1134,10 +1460,9 @@ async def test_repository_persists_pipeline_artifacts_and_run_states(
     assert claimed_steps[0].attempt_count == 1
     assert claimed_steps[0].started_at is None
     assert claimed_steps[0].request_metadata["portal_target"] == portal_target
-    assert await repository.list_analysis_candidates(
-        **candidate_identity,
-        publication_target_key="portal-push:Youtube",
-    ) == [VideoReference(video.youtube_video_id, video.video_url)]
+    assert await repository.list_publication_candidates(
+        "portal-push:Youtube",
+    ) == [expected_publication_candidate]
 
     assert await repository.claim_publication_step(
         analysis_id,
@@ -1215,10 +1540,9 @@ async def test_repository_persists_pipeline_artifacts_and_run_states(
     )
     assert in_progress_steps[0].status == "in_progress"
     assert in_progress_steps[0].started_at is not None
-    assert await repository.list_analysis_candidates(
-        **candidate_identity,
-        publication_target_key="portal-push:Youtube",
-    ) == [VideoReference(video.youtube_video_id, video.video_url)]
+    assert await repository.list_publication_candidates(
+        "portal-push:Youtube",
+    ) == [replace(expected_publication_candidate, requires_reconciliation=True)]
 
     await repository.mark_publication_step_created(
         analysis_id,
@@ -1229,10 +1553,9 @@ async def test_repository_persists_pipeline_artifacts_and_run_states(
         remote_status=0,
         response_metadata={"title": "Integration Video"},
     )
-    assert await repository.list_analysis_candidates(
-        **candidate_identity,
-        publication_target_key="portal-push:Youtube",
-    ) == [VideoReference(video.youtube_video_id, video.video_url)]
+    assert await repository.list_publication_candidates(
+        "portal-push:Youtube",
+    ) == [expected_publication_candidate]
     await repository.mark_publication_step_succeeded(
         analysis_id,
         "portal-push:Youtube",
@@ -1300,10 +1623,7 @@ async def test_repository_persists_pipeline_artifacts_and_run_states(
     assert completed_steps[1].remote_comment_id == 123
     assert completed_steps[1].attempt_count == 2
     assert (
-        await repository.list_analysis_candidates(
-            **candidate_identity,
-            publication_target_key="portal-push:Youtube",
-        )
+        await repository.list_publication_candidates("portal-push:Youtube")
         == []
     )
 
@@ -1370,27 +1690,9 @@ async def test_repository_persists_pipeline_artifacts_and_run_states(
             ),
         ],
     )
-    assert (
-        await repository.get_pending_publication_analysis_id(
-            video_id,
-            uncertain_target_key,
-        )
-        == analysis_id
-    )
-    assert (
-        await repository.list_analysis_candidates(
-            **candidate_identity,
-            publication_target_key=uncertain_target_key,
-        )
-        == []
-    )
-    assert (
-        await repository.list_analysis_candidates(
-            **(candidate_identity | {"force": True}),
-            publication_target_key=uncertain_target_key,
-        )
-        == []
-    )
+    assert await repository.list_publication_candidates(
+        uncertain_target_key,
+    ) == [replace(expected_publication_candidate, requires_reconciliation=True)]
 
     tags = await pool.fetch(
         """
@@ -1663,6 +1965,7 @@ async def test_repository_persists_pipeline_artifacts_and_run_states(
             profile_name="research-v1",
             schema_version="2026-08-04",
             run_metadata=run_metadata,
+            translated_subtitle="Other translated subtitle",
         )
 
     assert (

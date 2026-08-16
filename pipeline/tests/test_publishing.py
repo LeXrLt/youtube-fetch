@@ -15,6 +15,8 @@ from models import (
     ChannelMetadata,
     DownloadedSubtitle,
     FetchedVideo,
+    PublicationCandidate,
+    PublicationSource,
     PublicationStep,
     TranslationResult,
     VideoMetadata,
@@ -33,7 +35,9 @@ from portal import (
 )
 from publishing import (
     TARGET_KEY,
+    BbsPublicationBuilder,
     BbsPublisher,
+    BbsPushConsumer,
     PublicationStateError,
     PublicationUncertainError,
 )
@@ -668,7 +672,15 @@ def _translation() -> TranslationResult:
 
 def _outcome() -> AnalysisOutcome:
     return AnalysisOutcome(
-        payload={"sources": []},
+        payload={
+            "guests": [
+                {
+                    "name_original": "Guest Name",
+                    "title": "Example 公司创始人",
+                }
+            ],
+            "sources": [],
+        },
         projection=AnalysisProjection(
             is_relevant=True,
             relevance_score=0.9,
@@ -683,14 +695,21 @@ def _outcome() -> AnalysisOutcome:
     )
 
 
-def test_build_steps_creates_three_immutable_publication_snapshots() -> None:
-    repository = FakeRepository([])
+def _publication_source(language_code: str) -> PublicationSource:
+    return PublicationSource(
+        video_analysis_id=ANALYSIS_ID,
+        fetched=_fetched(language_code),
+        translated_text=_translation().translated_text,
+        outcome=_outcome(),
+    )
 
-    steps = BbsPublisher(repository).build_steps(_fetched("en"), _translation(), _outcome())
+
+def test_build_steps_creates_three_immutable_publication_snapshots() -> None:
+    steps = BbsPublicationBuilder().build_steps(_publication_source("en"))
 
     assert [step.step for step in steps] == ["topic", "translation", "source"]
     assert all(step.target_key == TARGET_KEY for step in steps)
-    assert steps[0].topic_title == "Video title"
+    assert steps[0].topic_title == ("Guest Name（Example 公司创始人）｜Channel｜2026-08-14")
     assert "## 视频信息" in (steps[0].markdown_snapshot or "")
     assert "中文摘要" in (steps[0].markdown_snapshot or "")
     assert steps[1].topic_title is None
@@ -703,10 +722,298 @@ def test_build_steps_creates_three_immutable_publication_snapshots() -> None:
 
 
 def test_build_steps_skips_source_comment_for_simplified_chinese() -> None:
-    repository = FakeRepository([])
-
-    steps = BbsPublisher(repository).build_steps(_fetched("zh_CN"), _translation(), _outcome())
+    steps = BbsPublicationBuilder().build_steps(_publication_source("zh_CN"))
 
     assert steps[2].step == "source"
     assert steps[2].markdown_snapshot is None
     assert steps[2].skipped is True
+
+
+class FakeConsumerRepository:
+    def __init__(
+        self,
+        candidates: Sequence[PublicationCandidate],
+        sources: dict[UUID, PublicationSource | None],
+        *,
+        analyses_with_steps: set[UUID] | None = None,
+    ) -> None:
+        self.candidates = list(candidates)
+        self.sources = sources
+        self.analyses_with_steps = analyses_with_steps or set()
+        self.reconciliation_statuses = {
+            candidate.video_analysis_id: "uncertain"
+            for candidate in candidates
+            if candidate.requires_reconciliation
+        }
+        self.calls: list[tuple[object, ...]] = []
+
+    async def list_publication_candidates(
+        self,
+        target_key: str,
+    ) -> list[PublicationCandidate]:
+        self.calls.append(("list_candidates", target_key))
+        return list(self.candidates)
+
+    async def list_publication_steps(
+        self,
+        video_analysis_id: UUID,
+        target_key: str,
+    ) -> list[PublicationStep]:
+        self.calls.append(("list_steps", video_analysis_id, target_key))
+        reconciliation_status = self.reconciliation_statuses.get(video_analysis_id)
+        if reconciliation_status is not None:
+            return [_step("topic", status=reconciliation_status)]
+        return [_step("topic")] if video_analysis_id in self.analyses_with_steps else []
+
+    async def get_publication_source(
+        self,
+        video_analysis_id: UUID,
+    ) -> PublicationSource | None:
+        self.calls.append(("get_source", video_analysis_id))
+        return self.sources.get(video_analysis_id)
+
+    async def ensure_publication_steps(
+        self,
+        video_analysis_id: UUID,
+        steps: Sequence[object],
+    ) -> None:
+        self.calls.append(("ensure_steps", video_analysis_id, tuple(step.step for step in steps)))
+
+
+class FakeConsumerPublisher:
+    target_key = TARGET_KEY
+
+    def __init__(
+        self,
+        outcomes: dict[UUID, bool | BaseException],
+    ) -> None:
+        self.outcomes = outcomes
+        self.calls: list[UUID] = []
+
+    async def publish(self, video_analysis_id: UUID) -> bool:
+        self.calls.append(video_analysis_id)
+        outcome = self.outcomes[video_analysis_id]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def _candidate(video_analysis_id: UUID, suffix: str) -> PublicationCandidate:
+    return PublicationCandidate(
+        video_analysis_id=video_analysis_id,
+        youtube_video_id=f"video-{suffix}",
+        video_url=f"https://youtube.test/watch?v=video-{suffix}",
+    )
+
+
+@pytest.mark.asyncio
+async def test_consumer_initializes_snapshots_then_publishes_candidate() -> None:
+    candidate = _candidate(ANALYSIS_ID, "one")
+    source = _publication_source("en")
+    repository = FakeConsumerRepository([candidate], {ANALYSIS_ID: source})
+    publisher = FakeConsumerPublisher({ANALYSIS_ID: True})
+
+    results = await BbsPushConsumer(  # type: ignore[arg-type]
+        repository,
+        publisher,
+    ).consume(limit=20)
+
+    assert [(result.status, result.video_analysis_id) for result in results] == [
+        ("published", ANALYSIS_ID)
+    ]
+    assert repository.calls == [
+        ("list_candidates", TARGET_KEY),
+        ("list_steps", ANALYSIS_ID, TARGET_KEY),
+        ("get_source", ANALYSIS_ID),
+        ("ensure_steps", ANALYSIS_ID, ("topic", "translation", "source")),
+    ]
+    assert publisher.calls == [ANALYSIS_ID]
+
+
+@pytest.mark.asyncio
+async def test_consumer_reuses_existing_snapshots_without_loading_source() -> None:
+    candidate = _candidate(ANALYSIS_ID, "one")
+    repository = FakeConsumerRepository(
+        [candidate],
+        {},
+        analyses_with_steps={ANALYSIS_ID},
+    )
+    publisher = FakeConsumerPublisher({ANALYSIS_ID: False})
+
+    results = await BbsPushConsumer(  # type: ignore[arg-type]
+        repository,
+        publisher,
+    ).consume(limit=None)
+
+    assert [result.status for result in results] == ["skipped"]
+    assert repository.calls == [
+        ("list_candidates", TARGET_KEY),
+        ("list_steps", ANALYSIS_ID, TARGET_KEY),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_consumer_records_failure_and_continues_with_snapshot_batch() -> None:
+    blocked_newer_id = UUID("22222222-2222-2222-2222-222222222222")
+    other_video_id = UUID("33333333-3333-3333-3333-333333333333")
+    candidates = [
+        _candidate(ANALYSIS_ID, "blocked"),
+        _candidate(blocked_newer_id, "blocked"),
+        _candidate(other_video_id, "other"),
+    ]
+    other_source = replace(
+        _publication_source("zh-CN"),
+        video_analysis_id=other_video_id,
+    )
+    repository = FakeConsumerRepository(
+        candidates,
+        {ANALYSIS_ID: None, other_video_id: other_source},
+    )
+    publisher = FakeConsumerPublisher({other_video_id: True})
+
+    results = await BbsPushConsumer(  # type: ignore[arg-type]
+        repository,
+        publisher,
+    ).consume(limit=2)
+
+    assert [result.status for result in results] == ["failed", "published"]
+    assert "cannot be reconstructed" in (results[0].detail or "")
+    assert [result.video_analysis_id for result in results] == [
+        ANALYSIS_ID,
+        other_video_id,
+    ]
+    assert publisher.calls == [other_video_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [None, 0])
+async def test_consumer_without_limit_drains_revisions_for_the_same_video(
+    limit: int | None,
+) -> None:
+    newer_id = UUID("22222222-2222-2222-2222-222222222222")
+    candidates = [
+        _candidate(ANALYSIS_ID, "shared"),
+        _candidate(newer_id, "shared"),
+    ]
+    repository = FakeConsumerRepository(
+        candidates,
+        {},
+        analyses_with_steps={ANALYSIS_ID, newer_id},
+    )
+    publisher = FakeConsumerPublisher({ANALYSIS_ID: True, newer_id: True})
+
+    results = await BbsPushConsumer(  # type: ignore[arg-type]
+        repository,
+        publisher,
+    ).consume(limit=limit)
+
+    assert [result.video_analysis_id for result in results] == [ANALYSIS_ID, newer_id]
+    assert [result.status for result in results] == ["published", "published"]
+    assert publisher.calls == [ANALYSIS_ID, newer_id]
+
+
+@pytest.mark.asyncio
+async def test_consumer_does_not_chase_candidates_added_after_snapshot() -> None:
+    late_id = UUID("22222222-2222-2222-2222-222222222222")
+    repository = FakeConsumerRepository(
+        [_candidate(ANALYSIS_ID, "initial")],
+        {},
+        analyses_with_steps={ANALYSIS_ID, late_id},
+    )
+
+    class AppendingPublisher(FakeConsumerPublisher):
+        async def publish(self, video_analysis_id: UUID) -> bool:
+            repository.candidates.append(_candidate(late_id, "late"))
+            return await super().publish(video_analysis_id)
+
+    publisher = AppendingPublisher({ANALYSIS_ID: True, late_id: True})
+
+    results = await BbsPushConsumer(  # type: ignore[arg-type]
+        repository,
+        publisher,
+    ).consume(limit=None)
+
+    assert [result.video_analysis_id for result in results] == [ANALYSIS_ID]
+    assert publisher.calls == [ANALYSIS_ID]
+    assert repository.calls.count(("list_candidates", TARGET_KEY)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reconciliation_status", "expected_reconciliation_publish_call"),
+    [("uncertain", False), ("in_progress", True)],
+)
+async def test_consumer_blocks_later_revisions_after_reconciliation_failure_for_one_run(
+    reconciliation_status: str,
+    expected_reconciliation_publish_call: bool,
+) -> None:
+    blocked_newer_id = UUID("22222222-2222-2222-2222-222222222222")
+    other_video_id = UUID("33333333-3333-3333-3333-333333333333")
+    candidates = [
+        replace(
+            _candidate(ANALYSIS_ID, "blocked"),
+            requires_reconciliation=True,
+        ),
+        _candidate(blocked_newer_id, "blocked"),
+        _candidate(other_video_id, "other"),
+    ]
+    repository = FakeConsumerRepository(
+        candidates,
+        {},
+        analyses_with_steps={ANALYSIS_ID, blocked_newer_id, other_video_id},
+    )
+    repository.reconciliation_statuses[ANALYSIS_ID] = reconciliation_status
+    publisher = FakeConsumerPublisher(
+        {
+            ANALYSIS_ID: PublicationUncertainError(
+                "remote result is uncertain; reconcile it before retrying"
+            ),
+            blocked_newer_id: True,
+            other_video_id: True,
+        }
+    )
+    consumer = BbsPushConsumer(repository, publisher)  # type: ignore[arg-type]
+
+    first_run = await consumer.consume(limit=1)
+
+    assert [result.video_analysis_id for result in first_run] == [
+        ANALYSIS_ID,
+        other_video_id,
+    ]
+    assert [result.status for result in first_run] == ["failed", "published"]
+    assert "reconcile" in (first_run[0].detail or "")
+    assert publisher.calls == (
+        [ANALYSIS_ID, other_video_id]
+        if expected_reconciliation_publish_call
+        else [other_video_id]
+    )
+
+
+@pytest.mark.asyncio
+async def test_consumer_propagates_cancellation() -> None:
+    candidate = _candidate(ANALYSIS_ID, "one")
+    repository = FakeConsumerRepository(
+        [candidate],
+        {},
+        analyses_with_steps={ANALYSIS_ID},
+    )
+    publisher = FakeConsumerPublisher({ANALYSIS_ID: asyncio.CancelledError()})
+
+    with pytest.raises(asyncio.CancelledError):
+        await BbsPushConsumer(  # type: ignore[arg-type]
+            repository,
+            publisher,
+        ).consume(limit=1)
+
+
+@pytest.mark.asyncio
+async def test_consumer_rejects_invalid_internal_limit() -> None:
+    repository = FakeConsumerRepository([], {})
+    publisher = FakeConsumerPublisher({})
+
+    for limit in (-1, True):
+        with pytest.raises(ValueError, match="non-negative integer or None"):
+            await BbsPushConsumer(  # type: ignore[arg-type]
+                repository,
+                publisher,
+            ).consume(limit=limit)

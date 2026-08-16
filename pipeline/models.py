@@ -157,6 +157,31 @@ class AnalysisOutcome:
     metadata: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class PublicationCandidate:
+    video_analysis_id: UUID
+    youtube_video_id: str
+    video_url: str
+    requires_reconciliation: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationSource:
+    video_analysis_id: UUID
+    fetched: FetchedVideo
+    translated_text: str
+    outcome: AnalysisOutcome
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationResult:
+    video_analysis_id: UUID
+    youtube_video_id: str
+    video_url: str
+    status: str
+    detail: str | None = None
+
+
 PublicationStepName = Literal["topic", "translation", "source"]
 PublicationStepStatus = Literal[
     "pending",

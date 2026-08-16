@@ -1064,6 +1064,12 @@ def _analysis() -> AnalysisOutcome:
         payload={
             "is_relevant": True,
             "filter_reason": "相关",
+            "guests": [
+                {
+                    "name_original": "Sam Altman",
+                    "title": "OpenAI 联合创始人兼 CEO",
+                }
+            ],
             "sources": [
                 {
                     "title": "Primary source",
@@ -1100,18 +1106,19 @@ def test_traditional_chinese_and_other_languages_are_not_simplified(
     assert not is_simplified_chinese_language(language)
 
 
-def test_publication_builder_structures_analysis_truncates_title_and_uses_dynamic_fence() -> None:
+def test_publication_builder_structures_analysis_and_uses_dynamic_fence() -> None:
     title = "题" * 140
     translated = "第一行\n```\n第二行 with ````` inside"
     source = "source\n``````\nend"
 
     publication = build_publication_content(_video(title), _analysis(), translated, "en", source)
 
-    assert publication.title == "题" * 128
-    assert len(publication.title) == 128
+    assert publication.title == (
+        "Sam Altman（OpenAI 联合创始人兼 CEO）｜Research Channel｜2026-08-14"
+    )
+    assert publication.topic_markdown.startswith("## 摘要\n\n中文摘要\n")
     assert "## 视频信息" in publication.topic_markdown
     assert "## AI 分析" in publication.topic_markdown
-    assert "### 摘要" in publication.topic_markdown
     assert "### 关键要点" in publication.topic_markdown
     assert "- 第一点" in publication.topic_markdown
     assert "- 第二点" in publication.topic_markdown
@@ -1125,6 +1132,131 @@ def test_publication_builder_structures_analysis_truncates_title_and_uses_dynami
     assert publication.source_comment_markdown is not None
     assert "```````text\n" in publication.source_comment_markdown
     assert source in publication.source_comment_markdown
+
+
+def test_publication_title_keeps_original_guest_names_and_orders_multiple_guests() -> None:
+    analysis = {
+        "summary": "摘要",
+        "guests": [
+            {"name_original": "Andrew Ng", "title": "DeepLearning.AI 创始人"},
+            {"name_original": "李飞飞", "title": "斯坦福大学教授"},
+        ],
+    }
+
+    publication = build_publication_content(
+        _video(),
+        analysis,
+        "译文",
+        "en",
+        "source",
+    )
+
+    assert publication.title == (
+        "Andrew Ng（DeepLearning.AI 创始人）、李飞飞（斯坦福大学教授）"
+        "｜Research Channel｜2026-08-14"
+    )
+
+
+@pytest.mark.parametrize(
+    "analysis",
+    [{"summary": "摘要"}, {"summary": "摘要", "guests": []}],
+)
+def test_publication_title_falls_back_to_video_title_without_guest_data(
+    analysis: dict[str, object],
+) -> None:
+    publication = build_publication_content(
+        _video(),
+        analysis,
+        "译文",
+        "en",
+        "source",
+    )
+
+    assert publication.title == "Research video｜Research Channel｜2026-08-14"
+
+
+def test_publication_title_preserves_channel_and_date_when_truncated() -> None:
+    channel = "C" * 80
+    video = {
+        "title": "Fallback",
+        "channel": {"title": channel},
+        "published_at": datetime(2026, 8, 14, tzinfo=UTC),
+    }
+    analysis = {
+        "summary": "摘要",
+        "guests": [
+            {
+                "name_original": "Guest " * 30,
+                "title": "Very long title " * 20,
+            }
+        ],
+    }
+
+    publication = build_publication_content(video, analysis, "译文", "en", "source")
+
+    assert len(publication.title) == 128
+    assert publication.title.endswith(f"｜{'C' * 31}…｜2026-08-14")
+
+
+def test_publication_title_marks_missing_publish_date_without_substituting_run_time() -> None:
+    video = {
+        "title": "Fallback",
+        "channel": {"title": "Channel"},
+        "published_at": None,
+    }
+
+    publication = build_publication_content(
+        video,
+        {
+            "summary": "摘要",
+            "guests": [{"name_original": "Guest", "title": "Founder"}],
+        },
+        "译文",
+        "en",
+        "source",
+    )
+
+    assert publication.title == "Guest（Founder）｜Channel｜日期未知"
+
+
+def test_publication_title_marks_unverified_guest_title_without_guessing() -> None:
+    publication = build_publication_content(
+        _video(),
+        {
+            "summary": "摘要",
+            "guests": [{"name_original": "Guest", "title": None}],
+        },
+        "译文",
+        "en",
+        "source",
+    )
+
+    assert publication.title == "Guest（身份未核实）｜Research Channel｜2026-08-14"
+
+
+def test_publication_title_rejects_malformed_structured_guest_data() -> None:
+    with pytest.raises(ValueError, match="name_original and title"):
+        build_publication_content(
+            _video(),
+            {
+                "summary": "摘要",
+                "guests": [{"name_original": "Guest", "title": "  "}],
+            },
+            "译文",
+            "en",
+            "source",
+        )
+
+
+def test_publication_builder_rejects_missing_summary() -> None:
+    with pytest.raises(ValueError, match="summary must be a non-empty string"):
+        build_publication_content(
+            _video(),
+            {"guests": []},
+            "译文",
+            "en",
+            "source",
+        )
 
 
 def test_publication_builder_omits_only_simplified_source_comment() -> None:

@@ -12,7 +12,7 @@ from uuid import UUID
 import pytest
 
 import main as main_module
-from models import ProcessResult
+from models import ProcessResult, PublicationResult
 
 
 class FakeRepository:
@@ -177,6 +177,64 @@ def _patch_runtime(
     return service
 
 
+def _patch_push_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[str],
+    results: list[PublicationResult],
+) -> None:
+    publisher = object()
+
+    def create_publisher(repository: FakeRepository) -> object:
+        assert isinstance(repository, FakeRepository)
+        events.append("publisher")
+        return publisher
+
+    class FakePushConsumer:
+        def __init__(
+            self,
+            repository: FakeRepository,
+            actual_publisher: object,
+        ) -> None:
+            assert isinstance(repository, FakeRepository)
+            assert actual_publisher is publisher
+            events.append("consumer")
+
+        async def consume(self, *, limit: int | None) -> list[PublicationResult]:
+            events.append(f"consume:{limit}")
+            return results
+
+    monkeypatch.setattr(main_module, "BbsPublisher", create_publisher)
+    monkeypatch.setattr(main_module, "BbsPushConsumer", FakePushConsumer)
+
+
+def test_service_factory_does_not_construct_bbs_publisher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = SimpleNamespace(agent=object(), youtube=object())
+    repository = object()
+    agent = object()
+    youtube = object()
+    analysis = object()
+
+    monkeypatch.setattr(main_module, "CodexStructuredAgent", lambda actual: agent)
+    monkeypatch.setattr(main_module, "YoutubeClient", lambda actual: youtube)
+    monkeypatch.setattr(
+        main_module,
+        "AnalysisEngine",
+        lambda actual_settings, actual_agent: analysis,
+    )
+
+    def reject_publisher(actual_repository: object) -> None:
+        del actual_repository
+        pytest.fail("The analysis service must not construct a BBS publisher")
+
+    monkeypatch.setattr(main_module, "BbsPublisher", reject_publisher)
+
+    service = main_module._service(settings, repository)  # type: ignore[arg-type]
+
+    assert isinstance(service, main_module.PipelineService)
+
+
 @pytest.mark.asyncio
 async def test_run_finishes_all_downloads_before_analysis(
     monkeypatch: pytest.MonkeyPatch,
@@ -288,6 +346,79 @@ async def test_analyze_uses_only_analysis_lock_and_limit(
             "detail": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "expected_limit"),
+    [
+        (["push"], None),
+        (["push", "--limit", "20"], 20),
+    ],
+)
+async def test_push_uses_publication_lock_without_constructing_analysis_service(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    arguments: list[str],
+    expected_limit: int | None,
+) -> None:
+    events: list[str] = []
+    _patch_runtime(monkeypatch, events)
+    result = PublicationResult(
+        video_analysis_id=UUID(int=2),
+        youtube_video_id="published-video",
+        video_url="https://www.youtube.com/watch?v=published-video",
+        status="published",
+    )
+    _patch_push_consumer(monkeypatch, events, [result])
+
+    exit_code = await main_module._run(main_module._parser().parse_args(arguments))
+
+    assert exit_code == 0
+    assert events == [
+        "migrate",
+        "connect",
+        "publisher",
+        "consumer",
+        "lock:publication:enter",
+        f"consume:{expected_limit}",
+        "lock:publication:exit",
+        "close",
+    ]
+    assert json.loads(capsys.readouterr().out) == [
+        {
+            "video_analysis_id": str(UUID(int=2)),
+            "youtube_video_id": "published-video",
+            "video_url": "https://www.youtube.com/watch?v=published-video",
+            "status": "published",
+            "detail": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_push_uncertain_reconciliation_failure_sets_nonzero_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _patch_runtime(monkeypatch, events)
+    _patch_push_consumer(
+        monkeypatch,
+        events,
+        [
+            PublicationResult(
+                video_analysis_id=UUID(int=3),
+                youtube_video_id="failed-video",
+                video_url="https://www.youtube.com/watch?v=failed-video",
+                status="failed",
+                detail="remote result is uncertain; reconcile it before retrying",
+            )
+        ],
+    )
+
+    exit_code = await main_module._run(main_module._parser().parse_args(["push"]))
+
+    assert exit_code == 1
 
 
 @pytest.mark.asyncio
@@ -483,6 +614,7 @@ async def test_session_cleanup_success_log_contains_counts_but_not_thread_ids(
         ["run", "--max-videos-per-channel", "-1"],
         ["download", "--max-videos-per-channel", "-1"],
         ["analyze", "--limit", "-1"],
+        ["push", "--limit", "-1"],
     ],
 )
 def test_parser_rejects_negative_limits(arguments: list[str]) -> None:

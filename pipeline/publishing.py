@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
@@ -9,11 +10,10 @@ from uuid import UUID
 
 from database import PipelineRepository
 from models import (
-    AnalysisOutcome,
-    FetchedVideo,
+    PublicationResult,
+    PublicationSource,
     PublicationStep,
     PublicationStepInput,
-    TranslationResult,
 )
 from portal import (
     CreatedComment,
@@ -30,6 +30,7 @@ from portal import (
 
 CATEGORY_NAME = "Youtube"
 TARGET_KEY = "portal-push:Youtube"
+LOGGER = logging.getLogger(__name__)
 
 
 class PublicationStateError(RuntimeError):
@@ -43,33 +44,21 @@ class PublicationUncertainError(PublicationStateError):
 PortalClientFactory = Callable[[], AbstractAsyncContextManager[PortalClient]]
 
 
-class BbsPublisher:
+class BbsPublicationBuilder:
     target_key = TARGET_KEY
-
-    def __init__(
-        self,
-        repository: PipelineRepository,
-        *,
-        env_path: Path | None = None,
-        client_factory: PortalClientFactory | None = None,
-    ) -> None:
-        self._repository = repository
-        resolved_env_path = env_path or default_portal_env_path()
-        self._client_factory = client_factory or (lambda: PortalClient(resolved_env_path))
 
     def build_steps(
         self,
-        fetched: FetchedVideo,
-        translation: TranslationResult,
-        outcome: AnalysisOutcome,
+        source: PublicationSource,
     ) -> Sequence[PublicationStepInput]:
+        fetched = source.fetched
         subtitle = fetched.subtitle
         if subtitle is None or subtitle.normalized_text is None:
             raise ValueError("A normalized subtitle is required for BBS publication")
         content = build_publication_content(
             fetched.metadata,
-            outcome,
-            translation.translated_text,
+            source.outcome,
+            source.translated_text,
             subtitle.language_code,
             subtitle.normalized_text,
         )
@@ -94,6 +83,129 @@ class BbsPublisher:
                 skipped=content.source_comment_markdown is None,
             ),
         )
+
+
+class BbsPushConsumer:
+    def __init__(
+        self,
+        repository: PipelineRepository,
+        publisher: BbsPublisher,
+        builder: BbsPublicationBuilder | None = None,
+    ) -> None:
+        self._repository = repository
+        self._publisher = publisher
+        self._builder = builder or BbsPublicationBuilder()
+
+    async def consume(self, *, limit: int | None) -> list[PublicationResult]:
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
+        ):
+            raise ValueError("limit must be a non-negative integer or None")
+        limit = limit or None
+        results: list[PublicationResult] = []
+        blocked_video_ids: set[str] = set()
+        attempted_candidates = 0
+        candidates = await self._repository.list_publication_candidates(
+            self._publisher.target_key,
+        )
+        for candidate in candidates:
+            if candidate.youtube_video_id in blocked_video_ids:
+                continue
+            diagnostic_only = candidate.requires_reconciliation
+            if not diagnostic_only and limit is not None and attempted_candidates >= limit:
+                continue
+            if not diagnostic_only:
+                attempted_candidates += 1
+            try:
+                steps = await self._repository.list_publication_steps(
+                    candidate.video_analysis_id,
+                    self._publisher.target_key,
+                )
+                if diagnostic_only:
+                    reconciliation_step = next(
+                        (
+                            step
+                            for step in steps
+                            if step.status in {"in_progress", "uncertain"}
+                        ),
+                        None,
+                    )
+                    if reconciliation_step is None:
+                        raise PublicationStateError(
+                            "The publication candidate no longer matches its "
+                            "reconciliation snapshot"
+                        )
+                    if reconciliation_step.status == "uncertain":
+                        raise PublicationUncertainError(
+                            _uncertain_message(
+                                candidate.video_analysis_id,
+                                reconciliation_step.step,
+                            )
+                        )
+                if not steps:
+                    source = await self._repository.get_publication_source(
+                        candidate.video_analysis_id
+                    )
+                    if source is None:
+                        raise PublicationStateError(
+                            "The persisted analysis cannot be reconstructed for publication"
+                        )
+                    await self._repository.ensure_publication_steps(
+                        candidate.video_analysis_id,
+                        self._builder.build_steps(source),
+                    )
+                published = await self._publisher.publish(candidate.video_analysis_id)
+                if diagnostic_only:
+                    raise PublicationStateError(
+                        "A reconciliation-only publication candidate advanced unexpectedly"
+                    )
+                results.append(
+                    PublicationResult(
+                        video_analysis_id=candidate.video_analysis_id,
+                        youtube_video_id=candidate.youtube_video_id,
+                        video_url=candidate.video_url,
+                        status="published" if published else "skipped",
+                        detail=(
+                            "BBS publication completed"
+                            if published
+                            else "BBS publication was already complete"
+                        ),
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                blocked_video_ids.add(candidate.youtube_video_id)
+                LOGGER.exception(
+                    "Failed to publish analysis %s for video %s",
+                    candidate.video_analysis_id,
+                    candidate.youtube_video_id,
+                )
+                results.append(
+                    PublicationResult(
+                        video_analysis_id=candidate.video_analysis_id,
+                        youtube_video_id=candidate.youtube_video_id,
+                        video_url=candidate.video_url,
+                        status="failed",
+                        detail=str(exc),
+                    )
+                )
+        return results
+
+
+class BbsPublisher:
+    target_key = TARGET_KEY
+
+    def __init__(
+        self,
+        repository: PipelineRepository,
+        *,
+        env_path: Path | None = None,
+        client_factory: PortalClientFactory | None = None,
+    ) -> None:
+        self._repository = repository
+        resolved_env_path = env_path or default_portal_env_path()
+        self._client_factory = client_factory or (lambda: PortalClient(resolved_env_path))
 
     async def publish(self, video_analysis_id: UUID) -> bool:
         steps = await self._repository.list_publication_steps(

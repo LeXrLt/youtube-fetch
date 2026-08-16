@@ -12,10 +12,13 @@ from config import DatabaseSettings
 from models import (
     AgentInvocation,
     AnalysisOutcome,
+    AnalysisProjection,
     ChannelMetadata,
     ChannelRecord,
     DownloadedSubtitle,
     FetchedVideo,
+    PublicationCandidate,
+    PublicationSource,
     PublicationStep,
     PublicationStepInput,
     StoredVideo,
@@ -614,7 +617,6 @@ class PipelineRepository:
         schema_sha256: str,
         force: bool,
         limit: int | None,
-        publication_target_key: str | None = None,
     ) -> list[VideoReference]:
         rows = await self._require_pool().fetch(
             """
@@ -632,79 +634,34 @@ class PipelineRepository:
                          subtitle.id DESC
                 LIMIT 1
             ) AS latest_subtitle ON true
-            LEFT JOIN LATERAL (
-                SELECT analysis.id
-                FROM video_analyses AS analysis
-                WHERE $8::text IS NOT NULL
-                  AND analysis.video_id = video.id
-                  AND EXISTS (
-                      SELECT 1
-                      FROM bbs_publication_steps AS publication
-                      WHERE publication.video_analysis_id = analysis.id
-                        AND publication.target_key = $8
-                        AND publication.status IN (
-                            'pending',
-                            'claimed',
-                            'in_progress',
-                            'created',
-                            'failed'
-                        )
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM bbs_publication_steps AS blocked_publication
-                      WHERE blocked_publication.video_analysis_id = analysis.id
-                        AND blocked_publication.target_key = $8
-                        AND blocked_publication.status = 'uncertain'
-                  )
-                ORDER BY analysis.analyzed_at ASC,
-                         analysis.created_at ASC,
-                         analysis.id ASC
-                LIMIT 1
-            ) AS pending_publication ON true
-            WHERE (
-               pending_publication.id IS NOT NULL
-               OR (
-                  latest_subtitle.normalized_text IS NOT NULL
-                  AND (
-                    $7::boolean
-                    OR NOT EXISTS (
-                      SELECT 1
-                      FROM video_analyses AS analysis
-                      JOIN analysis_runs AS run
-                        ON run.id = analysis.analysis_run_id
-                      WHERE analysis.video_id = video.id
-                        AND analysis.subtitle_track_id = latest_subtitle.id
-                        AND analysis.profile_name = $1
-                        AND analysis.output_schema_version = $2
-                        AND run.status = 'succeeded'
-                        AND run.prompt_version = $3
-                        AND run.metadata ->> 'prompt_sha256' = $4
-                        AND run.metadata ->> 'translation_schema_sha256' = $5
-                        AND run.metadata ->> 'schema_sha256' = $6
-                        AND run.metadata ->> 'source_sha256' = encode(
-                            digest(latest_subtitle.normalized_text, 'sha256'),
-                            'hex'
-                        )
-                        AND latest_subtitle.translated_text IS NOT NULL
-                        AND latest_subtitle.translated_language_code IS NOT NULL
-                    )
-                  )
-               )
-            )
-              AND NOT EXISTS (
+            WHERE latest_subtitle.normalized_text IS NOT NULL
+              AND (
+                $7::boolean
+                OR NOT EXISTS (
                   SELECT 1
-                  FROM video_analyses AS blocked_analysis
-                  JOIN bbs_publication_steps AS blocked_publication
-                    ON blocked_publication.video_analysis_id = blocked_analysis.id
-                  WHERE blocked_analysis.video_id = video.id
-                    AND blocked_publication.target_key = $8
-                    AND blocked_publication.status = 'uncertain'
+                  FROM video_analyses AS analysis
+                  JOIN analysis_runs AS run
+                    ON run.id = analysis.analysis_run_id
+                  WHERE analysis.video_id = video.id
+                    AND analysis.subtitle_track_id = latest_subtitle.id
+                    AND analysis.profile_name = $1
+                    AND analysis.output_schema_version = $2
+                    AND run.status = 'succeeded'
+                    AND run.prompt_version = $3
+                    AND run.metadata ->> 'prompt_sha256' = $4
+                    AND run.metadata ->> 'translation_schema_sha256' = $5
+                    AND run.metadata ->> 'schema_sha256' = $6
+                    AND run.metadata ->> 'source_sha256' = encode(
+                        digest(latest_subtitle.normalized_text, 'sha256'),
+                        'hex'
+                    )
+                    AND latest_subtitle.translated_text IS NOT NULL
+                    AND latest_subtitle.translated_language_code IS NOT NULL
+                )
               )
-            ORDER BY (pending_publication.id IS NULL) ASC,
-                     video.created_at ASC,
+            ORDER BY video.created_at ASC,
                      video.id ASC
-            LIMIT $9::integer
+            LIMIT $8::integer
             """,
             profile_name,
             schema_version,
@@ -713,7 +670,6 @@ class PipelineRepository:
             translation_schema_sha256,
             schema_sha256,
             force,
-            publication_target_key,
             limit,
         )
         return [
@@ -723,46 +679,6 @@ class PipelineRepository:
             )
             for row in rows
         ]
-
-    async def get_pending_publication_analysis_id(
-        self,
-        video_id: UUID,
-        target_key: str,
-    ) -> UUID | None:
-        return await self._require_pool().fetchval(
-            """
-            SELECT analysis.id
-            FROM video_analyses AS analysis
-            WHERE analysis.video_id = $1
-              AND EXISTS (
-                  SELECT 1
-                  FROM bbs_publication_steps AS publication
-                  WHERE publication.video_analysis_id = analysis.id
-                    AND publication.target_key = $2
-                    AND publication.status IN (
-                        'pending',
-                        'claimed',
-                        'in_progress',
-                        'created',
-                        'failed',
-                        'uncertain'
-                    )
-              )
-            ORDER BY CASE WHEN EXISTS (
-                         SELECT 1
-                         FROM bbs_publication_steps AS blocked_publication
-                         WHERE blocked_publication.video_analysis_id = analysis.id
-                           AND blocked_publication.target_key = $2
-                           AND blocked_publication.status = 'uncertain'
-                     ) THEN 0 ELSE 1 END,
-                     analysis.analyzed_at ASC,
-                     analysis.created_at ASC,
-                     analysis.id ASC
-            LIMIT 1
-            """,
-            video_id,
-            target_key,
-        )
 
     async def has_matching_analysis(
         self,
@@ -804,7 +720,6 @@ class PipelineRepository:
         translation_schema_sha256: str,
         schema_sha256: str,
         source_sha256: str,
-        publication_target_key: str | None = None,
     ) -> UUID | None:
         return await self._require_pool().fetchval(
             """
@@ -825,17 +740,7 @@ class PipelineRepository:
               AND run.metadata ->> 'source_sha256' = $9
               AND subtitle.translated_text IS NOT NULL
               AND subtitle.translated_language_code IS NOT NULL
-            ORDER BY CASE
-                       WHEN $10::text IS NOT NULL AND EXISTS (
-                           SELECT 1
-                           FROM bbs_publication_steps AS publication
-                           WHERE publication.video_analysis_id = analysis.id
-                             AND publication.target_key = $10
-                             AND publication.status NOT IN ('succeeded', 'skipped')
-                       ) THEN 0
-                       ELSE 1
-                     END,
-                     analysis.analyzed_at DESC,
+            ORDER BY analysis.analyzed_at DESC,
                      analysis.created_at DESC,
                      analysis.id DESC
             LIMIT 1
@@ -849,7 +754,6 @@ class PipelineRepository:
             translation_schema_sha256,
             schema_sha256,
             source_sha256,
-            publication_target_key,
         )
 
     async def start_analysis_run(
@@ -968,9 +872,10 @@ class PipelineRepository:
         profile_name: str,
         schema_version: str,
         run_metadata: dict[str, Any],
-        publication_steps: Sequence[PublicationStepInput] = (),
+        translated_subtitle: str,
     ) -> UUID:
-        normalized_publication_steps = _validate_publication_steps(publication_steps)
+        if not isinstance(translated_subtitle, str) or not translated_subtitle.strip():
+            raise ValueError("translated_subtitle must be a non-empty string")
         pool = self._require_pool()
         projection = outcome.projection
         async with pool.acquire() as connection, connection.transaction():
@@ -990,11 +895,12 @@ class PipelineRepository:
                     raw_agent_output,
                     profile_name,
                     output_schema_version,
-                    analysis_metadata
+                    analysis_metadata,
+                    translated_subtitle_snapshot
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                    $10::jsonb, $11::jsonb, $12, $13, $14::jsonb
+                    $10::jsonb, $11::jsonb, $12, $13, $14::jsonb, $15
                 )
                 RETURNING id
                 """,
@@ -1012,6 +918,7 @@ class PipelineRepository:
                 profile_name,
                 schema_version,
                 _json(outcome.metadata),
+                translated_subtitle,
             )
             for tag in projection.tags:
                 tag_id = await connection.fetchval(
@@ -1038,7 +945,347 @@ class PipelineRepository:
                     tag_id,
                     tag["confidence"],
                 )
-            if normalized_publication_steps:
+            await connection.execute(
+                """
+                UPDATE analysis_runs
+                SET status = 'succeeded',
+                    finished_at = now(),
+                    metadata = metadata || $2::jsonb
+                WHERE id = $1
+                """,
+                run_id,
+                _json(run_metadata),
+            )
+            return analysis_id
+
+    async def list_publication_candidates(
+        self,
+        target_key: str,
+    ) -> list[PublicationCandidate]:
+        _validate_target_key(target_key)
+
+        rows = await self._require_pool().fetch(
+            """
+            WITH automatic AS (
+                SELECT
+                    analysis.id AS video_analysis_id,
+                    analysis.video_id,
+                    video.youtube_video_id,
+                    video.video_url,
+                    analysis.analyzed_at,
+                    analysis.created_at,
+                    EXISTS (
+                        SELECT 1
+                        FROM bbs_publication_steps AS reconciliation_step
+                        WHERE reconciliation_step.video_analysis_id = analysis.id
+                          AND reconciliation_step.target_key = $1
+                          AND reconciliation_step.status IN (
+                              'in_progress',
+                              'uncertain'
+                          )
+                    ) AS requires_reconciliation
+                FROM video_analyses AS analysis
+                JOIN videos AS video ON video.id = analysis.video_id
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM bbs_publication_steps AS automatic_step
+                    WHERE automatic_step.video_analysis_id = analysis.id
+                      AND automatic_step.target_key = $1
+                      AND automatic_step.status IN (
+                          'pending',
+                          'claimed',
+                          'in_progress',
+                          'created',
+                          'failed',
+                          'uncertain'
+                      )
+                )
+                  AND (
+                      EXISTS (
+                          SELECT 1
+                          FROM bbs_publication_steps AS own_uncertain_step
+                          WHERE own_uncertain_step.video_analysis_id = analysis.id
+                            AND own_uncertain_step.target_key = $1
+                            AND own_uncertain_step.status = 'uncertain'
+                      )
+                      OR NOT EXISTS (
+                          SELECT 1
+                          FROM video_analyses AS blocked_analysis
+                          JOIN bbs_publication_steps AS blocked_step
+                            ON blocked_step.video_analysis_id = blocked_analysis.id
+                          WHERE blocked_analysis.video_id = analysis.video_id
+                            AND blocked_step.target_key = $1
+                            AND blocked_step.status = 'uncertain'
+                      )
+                  )
+            ),
+            initial AS (
+                SELECT
+                    analysis.id AS video_analysis_id,
+                    analysis.video_id,
+                    video.youtube_video_id,
+                    video.video_url,
+                    analysis.analyzed_at,
+                    analysis.created_at,
+                    false AS requires_reconciliation
+                FROM video_analyses AS analysis
+                JOIN analysis_runs AS run
+                  ON run.id = analysis.analysis_run_id
+                JOIN videos AS video ON video.id = analysis.video_id
+                JOIN subtitle_tracks AS subtitle
+                  ON subtitle.id = analysis.subtitle_track_id
+                 AND subtitle.video_id = analysis.video_id
+                WHERE run.status = 'succeeded'
+                  AND NULLIF(
+                      btrim(analysis.translated_subtitle_snapshot),
+                      ''
+                  ) IS NOT NULL
+                  AND NULLIF(
+                      btrim(
+                          COALESCE(
+                              analysis.translated_summary,
+                              analysis.summary
+                          )
+                      ),
+                      ''
+                  ) IS NOT NULL
+                  AND jsonb_typeof(
+                      analysis.raw_agent_output -> 'guests'
+                  ) = 'array'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM jsonb_array_elements(
+                          CASE
+                              WHEN jsonb_typeof(
+                                  analysis.raw_agent_output -> 'guests'
+                              ) = 'array'
+                              THEN analysis.raw_agent_output -> 'guests'
+                              ELSE '[]'::jsonb
+                          END
+                      ) AS guest(value)
+                      WHERE jsonb_typeof(guest.value) <> 'object'
+                         OR guest.value - ARRAY['name_original', 'title']
+                            <> '{}'::jsonb
+                         OR jsonb_typeof(
+                             guest.value -> 'name_original'
+                            ) <> 'string'
+                         OR NULLIF(
+                             btrim(guest.value ->> 'name_original'),
+                             ''
+                            ) IS NULL
+                         OR NOT (guest.value ? 'title')
+                         OR (
+                             guest.value -> 'title' <> 'null'::jsonb
+                             AND (
+                                 jsonb_typeof(guest.value -> 'title') <> 'string'
+                                 OR NULLIF(
+                                     btrim(guest.value ->> 'title'),
+                                     ''
+                                 ) IS NULL
+                             )
+                         )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM bbs_publication_steps AS existing_step
+                      WHERE existing_step.video_analysis_id = analysis.id
+                        AND existing_step.target_key = $1
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM video_analyses AS blocked_analysis
+                      JOIN bbs_publication_steps AS blocked_step
+                        ON blocked_step.video_analysis_id = blocked_analysis.id
+                      WHERE blocked_analysis.video_id = analysis.video_id
+                        AND blocked_step.target_key = $1
+                        AND blocked_step.status = 'uncertain'
+                  )
+            ),
+            eligible AS (
+                SELECT * FROM automatic
+                UNION ALL
+                SELECT * FROM initial
+            )
+            SELECT video_analysis_id, youtube_video_id, video_url,
+                   requires_reconciliation
+            FROM eligible
+            ORDER BY analyzed_at ASC, created_at ASC, video_analysis_id ASC
+            """,
+            target_key,
+        )
+        return [
+            PublicationCandidate(
+                video_analysis_id=row["video_analysis_id"],
+                youtube_video_id=row["youtube_video_id"],
+                video_url=row["video_url"],
+                requires_reconciliation=row["requires_reconciliation"],
+            )
+            for row in rows
+        ]
+
+    async def get_publication_source(
+        self,
+        video_analysis_id: UUID,
+    ) -> PublicationSource | None:
+        row = await self._require_pool().fetchrow(
+            """
+            SELECT
+                analysis.id AS video_analysis_id,
+                analysis.translated_subtitle_snapshot,
+                analysis.is_relevant,
+                analysis.relevance_score,
+                analysis.quality_score,
+                analysis.summary,
+                analysis.translated_summary,
+                analysis.background_notes,
+                analysis.key_points,
+                analysis.raw_agent_output,
+                analysis.analysis_metadata,
+                video.youtube_video_id,
+                video.title AS video_title,
+                video.description AS video_description,
+                video.video_url,
+                video.duration_seconds,
+                video.published_at,
+                channel.youtube_channel_id,
+                channel.title AS channel_title,
+                channel.channel_url,
+                channel.handle,
+                channel.description AS channel_description,
+                channel.avatar_url AS channel_avatar_url,
+                subtitle.language_code,
+                subtitle.language_name,
+                subtitle.source_format,
+                subtitle.is_auto_generated,
+                subtitle.raw_text,
+                subtitle.normalized_text,
+                COALESCE(
+                    (
+                        SELECT jsonb_agg(
+                            jsonb_build_object(
+                                'name', tag.name,
+                                'category', COALESCE(tag.category, ''),
+                                'description', COALESCE(tag.description, ''),
+                                'confidence', analysis_tag.confidence
+                            )
+                            ORDER BY tag.name
+                        )
+                        FROM video_analysis_tags AS analysis_tag
+                        JOIN tags AS tag ON tag.id = analysis_tag.tag_id
+                        WHERE analysis_tag.video_analysis_id = analysis.id
+                    ),
+                    '[]'::jsonb
+                ) AS tags
+            FROM video_analyses AS analysis
+            JOIN videos AS video ON video.id = analysis.video_id
+            JOIN youtube_channels AS channel ON channel.id = video.channel_id
+            JOIN subtitle_tracks AS subtitle
+              ON subtitle.id = analysis.subtitle_track_id
+             AND subtitle.video_id = analysis.video_id
+            WHERE analysis.id = $1
+              AND NULLIF(
+                  btrim(analysis.translated_subtitle_snapshot),
+                  ''
+              ) IS NOT NULL
+            """,
+            video_analysis_id,
+        )
+        if row is None:
+            return None
+
+        fetched = FetchedVideo(
+            metadata=VideoMetadata(
+                youtube_video_id=row["youtube_video_id"],
+                channel=ChannelMetadata(
+                    youtube_channel_id=row["youtube_channel_id"],
+                    title=row["channel_title"],
+                    channel_url=row["channel_url"],
+                    handle=row["handle"],
+                    description=row["channel_description"],
+                    avatar_url=row["channel_avatar_url"],
+                ),
+                title=row["video_title"],
+                video_url=row["video_url"],
+                description=row["video_description"],
+                duration_seconds=row["duration_seconds"],
+                published_at=row["published_at"],
+            ),
+            subtitle=DownloadedSubtitle(
+                language_code=row["language_code"],
+                language_name=row["language_name"],
+                source_format=row["source_format"] or "",
+                is_auto_generated=row["is_auto_generated"],
+                raw_text=row["raw_text"],
+                normalized_text=row["normalized_text"],
+            ),
+        )
+        outcome = AnalysisOutcome(
+            payload=_json_object(row["raw_agent_output"]),
+            projection=AnalysisProjection(
+                is_relevant=row["is_relevant"],
+                relevance_score=_optional_float(row["relevance_score"]),
+                quality_score=_optional_float(row["quality_score"]),
+                summary=row["summary"],
+                translated_summary=row["translated_summary"],
+                background_notes=row["background_notes"],
+                key_points=_json_list(row["key_points"]),
+                tags=_json_object_list(row["tags"]),
+            ),
+            metadata=_json_object(row["analysis_metadata"]),
+        )
+        return PublicationSource(
+            video_analysis_id=row["video_analysis_id"],
+            fetched=fetched,
+            translated_text=row["translated_subtitle_snapshot"],
+            outcome=outcome,
+        )
+
+    async def ensure_publication_steps(
+        self,
+        video_analysis_id: UUID,
+        steps: Sequence[PublicationStepInput],
+    ) -> None:
+        normalized_steps = _validate_publication_steps(steps)
+        if not normalized_steps:
+            raise ValueError("publication_steps must not be empty")
+        target_key = normalized_steps[0].target_key
+
+        pool = self._require_pool()
+        async with pool.acquire() as connection, connection.transaction():
+            analysis_exists = await connection.fetchval(
+                "SELECT true FROM video_analyses WHERE id = $1 FOR UPDATE",
+                video_analysis_id,
+            )
+            if analysis_exists is not True:
+                raise LookupError(f"Unknown video analysis ID: {video_analysis_id}")
+
+            existing_rows = await connection.fetch(
+                """
+                SELECT step, topic_title, markdown_snapshot, status
+                FROM bbs_publication_steps
+                WHERE video_analysis_id = $1 AND target_key = $2
+                """,
+                video_analysis_id,
+                target_key,
+            )
+            existing_by_step = {row["step"]: row for row in existing_rows}
+            for step in normalized_steps:
+                existing = existing_by_step.get(step.step)
+                if existing is None:
+                    continue
+                if (
+                    existing["topic_title"] != step.topic_title
+                    or existing["markdown_snapshot"] != step.markdown_snapshot
+                    or (existing["status"] == "skipped") != step.skipped
+                ):
+                    raise RuntimeError(
+                        "Existing publication steps use a different immutable snapshot"
+                    )
+
+            missing_steps = [
+                step for step in normalized_steps if step.step not in existing_by_step
+            ]
+            if missing_steps:
                 await connection.executemany(
                     """
                     INSERT INTO bbs_publication_steps(
@@ -1055,32 +1302,19 @@ class PipelineRepository:
                         CASE WHEN $6 THEN 'skipped' ELSE 'pending' END,
                         CASE WHEN $6 THEN now() ELSE NULL END
                     )
-                    ON CONFLICT (video_analysis_id, target_key, step) DO NOTHING
                     """,
                     [
                         (
-                            analysis_id,
+                            video_analysis_id,
                             step.target_key,
                             step.step,
                             step.topic_title,
                             step.markdown_snapshot,
                             step.skipped,
                         )
-                        for step in normalized_publication_steps
+                        for step in missing_steps
                     ],
                 )
-            await connection.execute(
-                """
-                UPDATE analysis_runs
-                SET status = 'succeeded',
-                    finished_at = now(),
-                    metadata = metadata || $2::jsonb
-                WHERE id = $1
-                """,
-                run_id,
-                _json(run_metadata),
-            )
-            return analysis_id
 
     async def list_publication_steps(
         self,
@@ -1471,6 +1705,15 @@ def _validate_publication_steps(
     return normalized
 
 
+def _validate_target_key(target_key: str) -> None:
+    if (
+        not isinstance(target_key, str)
+        or not target_key.strip()
+        or target_key != target_key.strip()
+    ):
+        raise ValueError("target_key must be a non-empty trimmed string")
+
+
 def _validate_publication_request_metadata(
     request_metadata: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -1509,6 +1752,21 @@ def _json_object(value: object) -> dict[str, Any]:
         decoded = json.loads(value)
         return decoded if isinstance(decoded, dict) else {}
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _json_list(value: object) -> list[Any]:
+    if isinstance(value, str):
+        decoded = json.loads(value)
+        return decoded if isinstance(decoded, list) else []
+    return list(value) if isinstance(value, list) else []
+
+
+def _json_object_list(value: object) -> list[dict[str, Any]]:
+    return [item for item in _json_list(value) if isinstance(item, dict)]
+
+
+def _optional_float(value: object) -> float | None:
+    return None if value is None else float(value)
 
 
 def _channel_record(row: asyncpg.Record) -> ChannelRecord:

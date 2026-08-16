@@ -15,7 +15,7 @@ from analysis import AnalysisEngine
 from codex_sessions import CodexSessionCleanupError, cleanup_historical_agent_sessions
 from config import DEFAULT_CONFIG_PATH, RuntimeSettings, load_settings
 from database import PipelineAlreadyRunningError, PipelineRepository
-from publishing import BbsPublisher
+from publishing import BbsPublisher, BbsPushConsumer
 from service import PipelineService
 from youtube import YoutubeClient, YoutubeMetadataError
 
@@ -101,6 +101,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument("--force", action="store_true", help="Create new analysis revisions")
 
+    push = subparsers.add_parser(
+        "push",
+        help="Publish analyzed subtitles pending in the database",
+    )
+    push.add_argument(
+        "--limit",
+        type=_non_negative_int,
+        default=0,
+        help="Maximum analyses to publish; 0 means unlimited",
+    )
+
     run = subparsers.add_parser(
         "run",
         help="Process specified channels or active database channels",
@@ -127,7 +138,6 @@ def _service(settings: RuntimeSettings, repository: PipelineRepository) -> Pipel
         repository,
         YoutubeClient(settings.youtube),
         AnalysisEngine(settings, agent),
-        BbsPublisher(repository),
     )
 
 
@@ -212,6 +222,21 @@ async def _run(args: argparse.Namespace) -> int:
     repository = PipelineRepository(settings.database)
     try:
         await repository.connect()
+        if args.command == "push":
+            if args.limit < 0:
+                raise ValueError("limit must not be negative")
+            consumer = BbsPushConsumer(repository, BbsPublisher(repository))
+            async with repository.process_lock("publication"):
+                results = await consumer.consume(limit=args.limit or None)
+            print(
+                json.dumps(
+                    [asdict(result) for result in results],
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
+            return _results_exit_code(results)
+
         service = _service(settings, repository)
         if args.command == "channel-add":
             channel_id = await service.add_channel(args.channel_url, args.researcher)

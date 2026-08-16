@@ -18,7 +18,7 @@ $subtitle_text
 """
 
 [analysis]
-version = "2"
+version = "3"
 template = """
 你是负责筛选 AI 研究内容的资深分析员。基于视频元数据和中文字幕生成结构化深度分析。
 
@@ -29,8 +29,9 @@ template = """
 4. 摘要、要点、过滤原因、背景补充和标签说明均使用简体中文。
 5. 背景补充应明确区别于字幕原话；无法核实的信息不要臆测。
 6. 可以使用网页搜索核实背景。使用外部资料时在 sources 中给出标题、URL 和用途；未使用则返回空数组。
-7. 标签使用下述 Topics 体系，优先复用已有 Topic，避免同义重复，最多 12 个。
-8. 只通过给定 JSON Schema 返回结果。
+7. 识别视频中受访或对谈的嘉宾，按主嘉宾优先、其次按首次出现顺序写入 guests。name_original 使用姓名原语言写法（外国人保留英文等原文，中国人使用中文），title 使用简体中文概括其在视频发布时与本期内容相关的身份或职务（例如“某公司创始人”）；身份无法核实时返回 null，不得猜测。主持人不算嘉宾；没有嘉宾时返回空数组。
+8. 标签使用下述 Topics 体系，优先复用已有 Topic，避免同义重复，最多 12 个。
+9. 只通过给定 JSON Schema 返回结果。
 
 ## 已有 Topics（优先使用，避免同义重复）
 tech:AI基础设施, tech:半导体, tech:AI应用, entity:NVIDIA, entity:OpenAI, entity:Anthropic, tech:云计算, tech:地缘政治风险, entity:SK Hynix, tech:科技股财报, entity:Samsung, tech:企业软件, entity:Google, entity:xAI, entity:TSMC, entity:Moonshot AI, tech:消费电子, entity:Micron, entity:Elon Musk, entity:Apple, entity:Meta, entity:SpaceX, entity:AMD, entity:Microsoft, event:Kimi K3发布, entity:SpaceXAI, entity:Intel, tech:AI监管, event:Grok 4.5发布, entity:Tesla

@@ -109,7 +109,7 @@ cd ..
 pipeline/.venv/bin/python pipeline/main.py run
 ```
 
-生产环境更适合将两个阶段作为独立调度任务：
+生产环境更适合将三个阶段作为独立调度任务：
 
 ```bash
 # 高频发现视频并下载字幕，不调用 Codex
@@ -117,6 +117,9 @@ pipeline/.venv/bin/python pipeline/main.py download
 
 # 消费数据库中的待分析字幕；0 表示不限量
 pipeline/.venv/bin/python pipeline/main.py analyze --limit 20
+
+# 消费成功分析并向 BBS 发布；0 表示不限量
+pipeline/.venv/bin/python pipeline/main.py push --limit 20
 ```
 
 有效规范化的简体中文字幕会在 `download` 保存字幕的同一数据库事务中原样写入
@@ -124,15 +127,19 @@ pipeline/.venv/bin/python pipeline/main.py analyze --limit 20
 非中文字幕仍由 `analyze` 调用 Codex 翻译为简体中文。下载结果在进入分析前已经提交到
 PostgreSQL。分析
 任务失败、取消或暂时未取得锁时，后续 `analyze` 可直接从数据库继续，不需要重新访问
-YouTube。两个命令可以同时运行；分析启动
-时会固定候选视频集合，新加入的视频留给下一轮；候选视频在执行前若被强制刷新，则读取其
+YouTube。下载、分析和发布三个命令可以同时运行；分析启动
+时会固定候选视频集合，发布启动时也通过单次查询固定 analysis revision 快照；新加入的视频或
+revision 留给下一轮。候选视频在执行前若被强制刷新，则读取其
 最新字幕。`analyze` 会先修复旧数据中缺失翻译的有效简体中文字幕，再允许匹配的既有成功分析
 返回 `skipped`。可分别设置不同的触发频率和超时，避免大量 Codex 任务拖延新字幕抓取。
 
-`analyze`、`run` 和 `video` 会在分析成功提交后向 bbs-go 发布，`download` 不触发发布。
-目标为 `Youtube` 分类：主题正文包含视频信息和 AI 分析，第一条一级评论是中文翻译，第二条
+`analyze`、`run` 和 `video` 只落库，不访问 bbs-go。分析成功时保存当次中文翻译字幕的不可变
+快照；只有 `push` 从成功分析队列中消费并向 bbs-go 发布。目标为 `Youtube` 分类：主题正文
+以摘要开头，然后包含视频信息和 AI 分析；第一条一级评论是中文翻译，第二条
 一级评论是原文。源语言经空白、下划线和大小写规范化后，只有 `zh`、`zh-Hans`、`zh-CN`、
 `zh-SG` 跳过原文评论；繁体中文会翻译为简体，并与其他语言一样继续发布原文。
+主题标题为“原语言嘉宾姓名（简体中文身份）｜频道｜YYYY-MM-DD”；多嘉宾按主嘉宾优先、
+其次首次出现顺序排列，无嘉宾时回退原视频标题，缺身份、频道或日期时使用明确的未知占位。
 
 启动 Web 服务：
 
@@ -146,13 +153,14 @@ Web 必须通过 `/<密钥>` 访问，根路径 `/` 返回 404。反向代理必
 不要在文档、日志或公开配置中记录实际密钥。
 
 生产环境中应使用外部调度器周期运行 Pipeline，并使用进程管理器保持 Web 服务常驻。
-PostgreSQL advisory lock 保证同一数据库最多同时运行一个下载阶段和一个分析阶段；同类
-任务重叠时后触发者立即失败且不会排队，下载与分析则可并行。`run` 和 `video` 也按阶段依次
-获取对应锁，不会同时占用两把锁。`config-check`、`migrate`、`channel-inspect` 和
+PostgreSQL advisory lock 保证同一数据库最多同时运行一个下载、一个分析和一个发布阶段；
+同类任务重叠时后触发者立即失败且不会排队，三个阶段则可并行。`download`、`analyze`、`push`
+分别使用下载、分析、publication advisory lock。`run` 和 `video` 也按下载、分析阶段依次
+获取对应锁，不会获取 publication 锁。`config-check`、`migrate`、`channel-inspect` 和
 `channel-add` 不占用阶段锁。
 
 旧版本只使用单一的 `pipeline_process` 锁，与新版阶段锁互不识别。升级时必须先停止旧版
-`run`/`video` 调度并等待进程完全退出，再启用新版 `download`/`analyze` 调度；不得让两个
+`run`/`video` 调度并等待进程完全退出，再启用新版 `download`/`analyze`/`push` 调度；不得让两个
 版本滚动混跑。`run` 的频道和每频道数量参数只限制下载阶段，随后仍会分析数据库中的全局
 候选；生产环境需要限制 Codex 工作量时使用独立的 `analyze --limit N`。
 
@@ -166,23 +174,32 @@ PostgreSQL advisory lock 保证同一数据库最多同时运行一个下载阶�
 `copied_chinese_source` 迁移元数据，不覆盖已有翻译。该历史迁移覆盖全部 `zh-*`；新版分析会
 把其中的繁体复制结果视为待重新翻译。应在启用新版 Pipeline 或 Web 前完成迁移。
 
-升级版本还包含 `013_bbs_publication_steps.sql`：它为每个新成功 analysis revision 保存
-主题、翻译和原文三步不可变 Markdown outbox 快照、状态、远程 ID 与验证元数据。必须先运行
-`./db/migrate.sh`，再启用带 BBS 发布的新 Pipeline 调度；独立 Web 部署也应在启动前完成
-迁移。该迁移不会为功能上线前的历史成功分析生成发布任务。`--force` 创建的每个新 revision
-都有独立 outbox 并各自发布，可能产生新的 BBS 主题。
+升级版本还包含 `013_bbs_publication_steps.sql`，用于保存主题、翻译和原文三步不可变
+Markdown outbox 快照、状态、远程 ID 与验证元数据。新流程不在分析事务内创建 outbox，而由
+`push` 首次消费时构建。
 
-发布按“提交分析和三步快照、创建后回读验证、从持久状态恢复”的边界运行。读取请求可有限
+`014_analysis_translation_snapshot.sql` 为成功分析增加不可变翻译字幕快照，并尝试回填
+元数据一致、可靠重建的历史 revision。部署时必须先运行 `./db/migrate.sh`，再启用
+新 Pipeline 与 Web。旧 revision 缺少可靠快照或结构化 `guests` 时不会首次入队；需要用
+当前 analysis prompt v3 和 `schema_version = "2"` 重新分析。升级前已存在的未完成 outbox
+仍由 `push` 恢复，不受首次入队条件限制。
+
+发布按“消费成功分析、首次初始化三步快照、创建后回读验证、从持久状态恢复”的边界运行。
+读取请求可有限
 重试，创建主题和评论的 POST 不自动重试。只完成本地领取的 `claimed` 步骤可安全重领；已保存
 远程 ID 的步骤可继续回读，明确失败且确认
-未写入的步骤可在后续 `analyze`、`run` 或 `video` 恢复；进程中断或远程结果不确定时步骤会
-进入 `uncertain`，调度会停止自动重放。此时必须人工在 BBS 核对是否已有对应主题或评论，
+未写入的步骤可在后续 `push` 恢复；进程中断或远程结果不确定时步骤会
+进入 `uncertain`，调度会停止自动重放该视频。已有 `uncertain` 或遗留 `in_progress` 会作为
+失败诊断输出并使命令返回非零，但不占正数 `--limit` 的新发布额度；同视频后续 revision 保持
+阻塞，其他视频继续处理，所以 JSON 结果数可能大于 limit。此时必须人工在 BBS 核对是否已有对应主题或评论，
 再决定如何处理状态，否则可能重复发布。该流程不保证 exactly-once。
 
 首次领取还会绑定规范化门户 origin、稳定用户 ID 和 `Youtube` 分类 ID。轮换同一账号的 token
 不影响恢复，但切换站点、账号或分类会在远程读写前停止。Portal 客户端禁用 `.curlrc` 和重定向，
 单个响应限制为 8 MiB，评论回读累计限制为 64 MiB且逐页清理；模型生成的分析文本按纯文本
 发布，参考链接仅接受 HTTP(S)。
+不得改变 portal-push 凭据路径和 `0600` 权限约束；门户请求和 JSON 处理继续只使用 `curl`
+与 `jq`，不要把真实凭据写入项目 `.env`、调度命令或日志。
 
 频道发现使用 Uploads playlist。新频道会完整回填，或按正数 `max_videos_per_channel` 分批
 回填；完整枚举并成功入队后立即记录 `initial_backfill_completed_at`，不等待字幕成功。此后

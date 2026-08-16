@@ -19,10 +19,32 @@
       "maximum": 100
     },
     "summary": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "background_notes": {
       "type": "string"
+    },
+    "guests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name_original": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "title": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "pattern": "\\S"
+          }
+        },
+        "required": ["name_original", "title"],
+        "additionalProperties": false
+      }
     },
     "key_points": {
       "type": "array",
@@ -83,6 +105,7 @@
     "quality_score",
     "summary",
     "background_notes",
+    "guests",
     "key_points",
     "tags",
     "sources"

@@ -25,8 +25,9 @@ Next.js App 读取并展示。
 - 对有效规范化简体中文字幕直接复制翻译字段；调用 Codex Agent 翻译繁体及非中文字幕，并完成
   相关性过滤、背景补充、评分和标签提取。
 - 将视频元数据、字幕、分析过程和分析结果写入 PostgreSQL。
-- 在成功提交分析和不可变 outbox 快照后，通过 bbs-go 将 AI 分析、翻译和按语言规则保留的
-  原文发布到 `Youtube` 分类，并回读校验远程结果。
+- 在成功分析中保存不可变的中文翻译字幕快照，但分析进程只落库、不访问门户。
+- 通过独立 `push` 消费成功分析，首次构建不可变三步 outbox，再将 AI 分析、翻译和
+  按语言规则保留的原文发布到 bbs-go `Youtube` 分类并回读校验。
 
 Python 中涉及 HTTP、文件和数据库的 I/O 路径应优先采用异步实现。所有 Python
 命令和依赖安装必须使用 `pipeline/.venv`；完整安装和操作说明见
@@ -60,12 +61,13 @@ PostgreSQL 由本机已有服务提供，本项目不负责安装或部署数据
 
 ```text
 YouTube -> yt-dlp -> 字幕清洗 -> 简体中文字幕翻译字段复制 -> PostgreSQL
-PostgreSQL -> Codex Agent -> PostgreSQL -> Next.js App
-                                  -> bbs-go Youtube 分类
+PostgreSQL -> Codex Agent -> 分析与翻译快照 -> PostgreSQL -> Next.js App
+PostgreSQL -> push -> 三步 outbox -> bbs-go Youtube 分类
 ```
 
 下载阶段完成后不等待 Agent 即可释放下载调度资源；分析阶段只读取数据库，不访问 YouTube。
-因此两个阶段可由独立进程并行运行，分析积压不会阻止后续频道继续发现和下载字幕。
+因此下载、分析和发布可由三个独立进程并行运行；任一下游积压都不会阻止频道继续发现和
+下载字幕。
 
 ## 3. 环境配置
 
@@ -152,7 +154,7 @@ install、`src/<package>` 布局或项目 wheel。Pipeline 入口为 `pipeline/m
 ### 4.1 新设备部署
 
 `db/migrate.sh` 是部署前置钩子。Pipeline 已实现 `channel-inspect`、`migrate`、
-`channel-add`、`download`、`analyze`、`video` 和 `run` 命令；只读的 `config-check`、
+`channel-add`、`download`、`analyze`、`push`、`video` 和 `run` 命令；只读的 `config-check`、
 `channel-inspect` 不执行迁移，其余命令会在数据库连接和业务操作前自动执行迁移。独立部署
 Next.js App 时仍须在启动前显式执行迁移：
 
@@ -165,15 +167,24 @@ set -e
 新增部署编排、systemd、容器 entrypoint 或 CI/CD workflow 时，必须把该命令接入其
 pre-deploy 阶段，不能依赖开发者手工执行 SQL。
 
-下载和分析在业务数据库上使用名称不同的 PostgreSQL 会话级 advisory lock。`download`
-持下载锁，`analyze` 持分析锁；`run` 和 `video` 按下载、分析顺序分别持锁，中间先释放下载
-锁。同类任务互斥并在竞争时立即失败，下载与分析任务可同时运行。锁使用独立连接，不占用
+下载、分析和发布在业务数据库上使用三把名称不同的 PostgreSQL 会话级 advisory lock。
+`download`、`analyze`、`push` 分别持下载、分析、发布锁；`run` 和 `video` 按下载、分析
+顺序分别持锁，
+中间先释放下载锁，且不持发布锁。同类任务互斥并在竞争时立即失败，三种任务可同时运行。
+锁使用独立连接，不占用
 asyncpg 业务连接池；连接关闭时由 PostgreSQL 自动释放，因此不得将其改为可能遗留陈旧
 状态的普通标记行或 PID 文件。频道管理和只读检查命令不使用阶段锁。
 
 `[pipeline].download_concurrency` 对频道发现与视频字幕抓取共享一个异步并发上限，默认
 为 `4`，配置校验范围是 `1..16`。分析保持单视频顺序执行。生产调度应优先分别运行
-`download` 和 `analyze --limit N`；`run` 用于兼容原有一次性流程，但也会先完成所有下载，
+`download`、`analyze --limit N` 和 `push --limit N`；`push --limit 0` 表示不限量，适合
+作为独立定时任务：
+
+```bash
+pipeline/.venv/bin/python pipeline/main.py push --limit 20
+```
+
+`run` 用于兼容原有一次性下载+分析流程，但也会先完成所有下载，
 再分析数据库中的全局候选视频集合；`run` 的频道和每频道数量参数只约束下载阶段。
 
 频道发现通过频道 ID 对应的 Uploads playlist 完成。首次回填不限量时完整枚举；设置正数
@@ -195,24 +206,36 @@ Pipeline 先把发现的视频引用幂等登记到 `videos`，再一次性读�
 完成即提交到 PostgreSQL，后续分析失败或取消时可独立恢复；`analyze` 遇到旧数据中缺失翻译的有效简体中文
 字幕时，会先补齐同样的复制结果，再允许命中既有成功分析并返回 `skipped`。
 
-分析发布采用三步持久化 outbox。`complete_analysis_run` 在提交成功 analysis revision 的
-同一事务中写入 `topic`、`translation`、`source` 的不可变 Markdown 快照，提交后才依次向
-bbs-go 写入“AI 分析主题、中文翻译一级评论、原文字幕一级评论”并逐步回读验证。源语言经
+分析和发布以成功 analysis revision 为边界解耦。`complete_analysis_run` 只在分析事务中写入
+结果和不可变 `translated_subtitle_snapshot`，不构建 outbox、不访问 bbs-go。独立 `push`
+启动时通过单次查询固定本轮候选快照，按成功分析的先后顺序消费；运行期间新增的 revision 留给
+下一轮。首次消费时才由持久化 revision 构建 `topic`、`translation`、`source`
+的不可变 Markdown outbox，再依次写入“AI 分析主题、中文翻译一级评论、原文字幕一级评论”
+并逐步回读验证。主题正文以摘要开头。源语言经
 trim、下划线转连字符和大小写规范化后，仅 `zh`、`zh-Hans`、`zh-CN`、`zh-SG` 跳过原文
-评论；繁体中文会翻译为简体并保留繁体原文，其他语言均保留原文评论。`analyze`、`run`、
-`video` 会触发发布，`download` 不会。
+评论；繁体中文会翻译为简体并保留繁体原文，其他语言均保留原文评论。只有 `push` 触发发布。
+
+发布标题为“原语言嘉宾姓名（简体中文身份）｜频道｜YYYY-MM-DD”。多嘉宾依分析提示词中的
+主嘉宾优先、其次首次出现顺序排列；无嘉宾回退原视频标题。无法核实身份、频道或日期时分别使用
+“身份未核实”、“频道未知”、“日期未知”。
 
 远程 GET 可有限重试，非幂等 POST 不自动重试。只完成本地领取的 `claimed` 可安全重领，
 `created` 状态可依照已保存远程 ID 恢复回读，明确未写入的 `failed` 状态可再次执行；真正开始
 POST 后中断或传输结果不明会进入 `uncertain`，必须人工检查
-远程主题或评论，不能自动重放。这不是 exactly-once 协议。上线前没有 outbox 行的历史成功
-分析不会回填；每个 `--force` 新 revision 都生成并发布自己的一组三步快照，但同一视频和目标
-存在 `uncertain` 时必须先人工核对，不能用 `--force` 绕过。
+远程主题或评论，不能自动重放。这不是 exactly-once 协议。已有未完成 outbox 总是恢复；
+预存 `uncertain` 或遗留 `in_progress` 会作为失败诊断输出、使 CLI 返回非零并阻塞同视频后续
+revision，但不占正数 `--limit` 的新发布额度，因此其他视频仍能继续。正数 limit 约束的是本轮
+可自动推进的候选数，JSON 结果数可能因这些诊断而更大。
+没有 outbox 的历史 revision 只有同时具备可靠翻译快照和结构化 `guests` 才能首次入队。
+不满足时需要
+用 analysis prompt v3、`schema_version = "2"` 重新分析。同一视频和目标存在 `uncertain` 时必须先人工核对。
 
 首次领取会把规范化门户 origin、稳定用户 ID、分类 ID 和账号名写入不可变目标元数据；恢复
 时先在任何认证请求前校验 origin，再核对账号和分类，配置不一致时禁止继续。`curl` 禁用默认
 配置和重定向；单响应限制为 8 MiB，评论回读累计限制为 64 MiB且逐页清理。模型派生字段按
 纯文本转义，外部参考链接仅允许 HTTP(S)。
+发布实现必须继续复用 portal-push 凭据约定，且门户 HTTP 请求与 JSON 处理只使用
+`curl` 和 `jq`，不得将凭据移入项目 `.env` 或改用临时脚本绕过这些约束。
 
 运行日志以业务状态为可观测边界。默认 `INFO` 记录频道发现的模式、数量和停止原因，以及
 字幕任务的开始、成功、无匹配字幕、无法规范化、跳过、失败和 `retry` 队列来源。yt-dlp 的
@@ -240,7 +263,7 @@ POST 后中断或传输结果不明会进入 `uncertain`，必须人工检查
 | `subtitle_tracks` | 原始、规范化及翻译字幕；区分语言、人工/自动来源和原始内容版本 |
 | `analysis_runs` | Codex 执行批次、视频/字幕身份、模型、提示词版本、状态和运行元数据 |
 | `agent_invocations` | 每次 Agent 调用的结构化输入、完整提示词、流式事件、原始/解析输出和错误 |
-| `video_analyses` | profile、Schema 版本、投影字段、分析元数据和完整 JSONB Agent 输出 |
+| `video_analyses` | profile、Schema 版本、投影字段、分析元数据、不可变翻译字幕快照和完整 JSONB Agent 输出 |
 | `tags` | 可复用标签及标签分类 |
 | `video_analysis_tags` | 分析结果与标签的多对多关系及置信度 |
 | `bbs_publication_steps` | 每个 analysis revision 的三步不可变 BBS Markdown 快照、发布状态、远程 ID 和验证元数据 |
@@ -248,7 +271,7 @@ POST 后中断或传输结果不明会进入 `uncertain`，必须人工检查
 `schema_migrations` 由迁移脚本维护，不属于业务表，其中保存迁移文件名、SHA-256
 和应用时间。主键使用 UUID；关键外键、唯一约束、0 到 100 的评分范围约束及列表
 查询常用索引由迁移创建。当前迁移链截至
-`013_bbs_publication_steps.sql`：
+`014_analysis_translation_snapshot.sql`：
 
 - `002` 约束分析引用的字幕必须属于同一视频。
 - `003` 增加翻译字段与元数据、run 的视频/字幕身份、分析 profile、输出 Schema 版本、
@@ -268,11 +291,15 @@ POST 后中断或传输结果不明会进入 `uncertain`，必须人工检查
   源语言和 `copied_chinese_source` 迁移元数据；已有翻译不覆盖。
 - `013` 增加 `bbs_publication_steps`，约束每个 analysis revision 的主题、翻译和原文三步
   快照及状态，禁止修改目标与内容快照，并为待恢复步骤建立部分索引。
+- `014` 增加 `video_analyses.translated_subtitle_snapshot`，在元数据能证明翻译身份一致时
+  回填历史成功分析，并强制新快照非空且不可变。
 
 完整 Agent 输出保存在 `video_analyses.raw_agent_output` JSONB，以允许 Schema 演进；
 稳定查询字段通过 `pipeline/config/pipeline.toml` 中的 JSON Pointer 投影到关系字段。
 提示词和两个 JSON Schema 的 SHA-256 由配置加载器自动计算，并与规范化字幕来源哈希、
 profile、Schema 版本和提示词版本共同决定是否复用已有分析。
+当前 analysis prompt 为 v3，`schema_version` 为 `2`；Schema 2 包含结构化 `guests`，
+用于生成可验证的嘉宾标题。
 
 ## 6. 本地初始化与校验
 
@@ -284,11 +311,12 @@ profile、Schema 版本和提示词版本共同决定是否复用已有分析。
 ./db/test_migrations.sh
 ```
 
-第一次执行应创建数据库并应用所有未执行迁移；第二次执行应对 `001` 至 `013` 均输出
+第一次执行应创建数据库并应用所有未执行迁移；第二次执行应对 `001` 至 `014` 均输出
 `Skipping ...`。
 测试脚本会预留并标记一个高熵名称的临时数据库，验证空库并发迁移、重复执行、
 环境变量优先级、迁移校验和、失败回滚、表结构、下载状态约束与历史回填、中文翻译回填、
-BBS 发布步骤约束与快照不可变性、跨视频字幕约束和删除字幕后的引用清理，结束时自动删除
+BBS 发布步骤约束、outbox 与翻译字幕快照不可变性、跨视频字幕约束和删除字幕后的引用清理，
+结束时自动删除
 临时数据库和测试文件。
 
 可以使用以下命令检查项目数据库的迁移记录和表：

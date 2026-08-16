@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 import config as config_module
@@ -104,6 +105,51 @@ async def test_load_settings_rejects_invalid_json_schema(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_analysis_schema_requires_structured_guests() -> None:
+    settings = await load_settings()
+    validator = Draft202012Validator(settings.analysis_schema)
+    payload = {
+        "is_relevant": True,
+        "filter_reason": "相关",
+        "relevance_score": 90,
+        "quality_score": 80,
+        "summary": "摘要",
+        "background_notes": "",
+        "guests": [
+            {
+                "name_original": "Andrew Ng",
+                "title": "DeepLearning.AI 创始人",
+            }
+        ],
+        "key_points": [],
+        "tags": [],
+        "sources": [],
+    }
+
+    assert list(validator.iter_errors(payload)) == []
+    assert any(
+        error.validator == "required"
+        for error in validator.iter_errors(
+            {key: value for key, value in payload.items() if key != "guests"}
+        )
+    )
+    invalid_guest = {**payload, "guests": [{"name_original": "", "title": "创始人"}]}
+    assert any(error.validator == "minLength" for error in validator.iter_errors(invalid_guest))
+    assert any(
+        error.validator == "pattern"
+        for error in validator.iter_errors({**payload, "summary": "   "})
+    )
+    assert (
+        list(
+            validator.iter_errors(
+                {**payload, "guests": [{"name_original": "Guest", "title": None}]}
+            )
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
 async def test_load_settings_requires_private_cookie_permissions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -128,9 +174,7 @@ async def test_load_settings_uses_chrome_on_macos_without_cookie_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config_text = (PIPELINE_ROOT / "config" / "pipeline.toml").read_text(
-        encoding="utf-8"
-    )
+    config_text = (PIPELINE_ROOT / "config" / "pipeline.toml").read_text(encoding="utf-8")
     missing_cookie_file = tmp_path / "missing.cookies.txt"
     config_file = tmp_path / "pipeline.toml"
     config_file.write_text(

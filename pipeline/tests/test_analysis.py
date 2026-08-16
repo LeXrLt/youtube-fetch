@@ -232,6 +232,12 @@ async def test_analysis_projects_common_fields_and_preserves_payload() -> None:
         "quality_score": 87.5,
         "summary": "摘要",
         "background_notes": "背景",
+        "guests": [
+            {
+                "name_original": "Andrew Ng",
+                "title": "DeepLearning.AI 创始人",
+            }
+        ],
         "key_points": ["要点"],
         "tags": [
             {
@@ -266,6 +272,7 @@ async def test_analysis_projects_common_fields_and_preserves_payload() -> None:
     assert fake.calls[0]["sequence_number"] == 1
     assert fake.calls[0]["agent_input"]["subtitle_text"] == "中文字幕"
     assert "中文字幕" in fake.calls[0]["prompt"]
+    assert "name_original 使用姓名原语言写法" in fake.calls[0]["prompt"]
     assert saved[0].stage == "analysis"
 
 

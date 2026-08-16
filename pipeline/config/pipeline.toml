@@ -35,7 +35,7 @@ prompt_file = "config/prompts.toml"
 translation_schema_file = "config/translation.schema.json"
 analysis_schema_file = "config/analysis.schema.json"
 profile_name = "default"
-schema_version = "1"
+schema_version = "2"
 
 [projection]
 translated_text = "/translated_text"

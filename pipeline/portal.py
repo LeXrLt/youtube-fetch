@@ -1224,7 +1224,6 @@ def build_publication_content(
     title = _video_value(video, "title")
     if not isinstance(title, str) or not title.strip():
         raise ValueError("video title must be a non-empty string")
-    publication_title = title.strip()[:128]
     if not translated_text.strip():
         raise ValueError("translated_text must not be empty")
     if not source_text.strip():
@@ -1238,8 +1237,21 @@ def build_publication_content(
     channel_title = _object_value(channel, "title")
     channel_url = _object_value(channel, "channel_url")
     published_at = _video_value(video, "published_at")
+    publication_title = _build_publication_title(
+        title,
+        channel_title,
+        published_at,
+        payload,
+    )
 
-    lines = ["## 视频信息", ""]
+    summary = _object_value(projection, "translated_summary") or _object_value(
+        projection, "summary"
+    )
+    if not isinstance(summary, str) or not summary.strip():
+        raise ValueError("analysis summary must be a non-empty string")
+    lines = ["## 摘要", "", _escape_markdown_text(summary.strip()), ""]
+
+    lines.extend(["## 视频信息", ""])
     safe_video_url = _safe_http_url(video_url)
     escaped_title = _escape_markdown_text(title.strip())
     if safe_video_url is not None:
@@ -1259,12 +1271,6 @@ def build_publication_content(
     lines.append(f"- 字幕语言：{escaped_source_language}")
 
     lines.extend(["", "## AI 分析", ""])
-    summary = _object_value(projection, "translated_summary") or _object_value(
-        projection, "summary"
-    )
-    if isinstance(summary, str) and summary.strip():
-        lines.extend(["### 摘要", "", _escape_markdown_text(summary.strip()), ""])
-
     background = _object_value(projection, "background_notes")
     if isinstance(background, str) and background.strip():
         lines.extend(["### 背景补充", "", _escape_markdown_text(background.strip()), ""])
@@ -1328,6 +1334,70 @@ def build_publication_content(
         source_comment_markdown=source_comment,
         tags=(),
     )
+
+
+def _build_publication_title(
+    video_title: str,
+    channel_title: object,
+    published_at: object,
+    payload: Mapping[str, object],
+) -> str:
+    subject = _publication_guest_subject(payload, video_title)
+    channel = _normalized_title_component(channel_title) or "频道未知"
+    published_date = (
+        published_at.date().isoformat() if isinstance(published_at, datetime) else "日期未知"
+    )
+    separator = "｜"
+    rendered = separator.join((subject, channel, published_date))
+    if len(rendered) <= 128:
+        return rendered
+
+    channel = _truncate_title_component(channel, 32)
+    subject_limit = 128 - len(channel) - len(published_date) - 2 * len(separator)
+    subject = _truncate_title_component(subject, max(subject_limit, 1))
+    return separator.join((subject, channel, published_date))[:128]
+
+
+def _publication_guest_subject(
+    payload: Mapping[str, object],
+    video_title: str,
+) -> str:
+    fallback = _normalized_title_component(video_title)
+    raw_guests = payload.get("guests")
+    if raw_guests is None:
+        return fallback
+    if not isinstance(raw_guests, Sequence) or isinstance(raw_guests, str | bytes):
+        raise ValueError("analysis guests must be an array")
+
+    rendered: list[str] = []
+    for guest in raw_guests:
+        if not isinstance(guest, Mapping):
+            raise ValueError("each analysis guest must be an object")
+        name = _normalized_title_component(guest.get("name_original"))
+        if "title" not in guest:
+            raise ValueError("analysis guest title is required")
+        raw_guest_title = guest.get("title")
+        guest_title = (
+            "身份未核实"
+            if raw_guest_title is None
+            else _normalized_title_component(raw_guest_title)
+        )
+        if not name or not guest_title:
+            raise ValueError("analysis guest name_original and title must not be empty")
+        rendered.append(f"{name}（{guest_title}）")
+    return "、".join(rendered) if rendered else fallback
+
+
+def _normalized_title_component(value: object) -> str:
+    return " ".join(value.split()) if isinstance(value, str) else ""
+
+
+def _truncate_title_component(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    if limit <= 1:
+        return value[:limit]
+    return value[: limit - 1] + "…"
 
 
 def _load_portal_env(env_path: Path) -> tuple[str, str, bool]:

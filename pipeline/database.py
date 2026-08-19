@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -232,7 +233,7 @@ class PipelineRepository:
         if not references:
             return {}
 
-        unique_references: dict[str, tuple[str, str]] = {}
+        unique_references: dict[str, tuple[str, str, datetime | None]] = {}
         for reference in references:
             youtube_video_id = reference.youtube_video_id.strip()
             video_url = reference.video_url.strip()
@@ -241,11 +242,16 @@ class PipelineRepository:
             if not video_url:
                 raise ValueError("video_url must be a non-empty string")
             title = (reference.title or "").strip() or youtube_video_id
-            unique_references[youtube_video_id] = (video_url, title)
+            unique_references[youtube_video_id] = (
+                video_url,
+                title,
+                reference.published_at,
+            )
 
         youtube_video_ids = list(unique_references)
         video_urls = [unique_references[video_id][0] for video_id in youtube_video_ids]
         titles = [unique_references[video_id][1] for video_id in youtube_video_ids]
+        published_at = [unique_references[video_id][2] for video_id in youtube_video_ids]
         rows = await self._require_pool().fetch(
             """
             INSERT INTO videos(
@@ -253,12 +259,14 @@ class PipelineRepository:
                 youtube_video_id,
                 title,
                 video_url,
+                published_at,
                 subtitle_download_status,
                 subtitle_download_error
             )
-            SELECT $1, input.youtube_video_id, input.title, input.video_url, 0, NULL
-            FROM unnest($2::text[], $3::text[], $4::text[])
-                AS input(youtube_video_id, video_url, title)
+            SELECT $1, input.youtube_video_id, input.title, input.video_url,
+                   input.published_at, 0, NULL
+            FROM unnest($2::text[], $3::text[], $4::text[], $5::timestamptz[])
+                AS input(youtube_video_id, video_url, title, published_at)
             ON CONFLICT (youtube_video_id) DO UPDATE
             SET channel_id = EXCLUDED.channel_id,
                 title = CASE
@@ -267,6 +275,7 @@ class PipelineRepository:
                     ELSE EXCLUDED.title
                 END,
                 video_url = EXCLUDED.video_url,
+                published_at = COALESCE(EXCLUDED.published_at, videos.published_at),
                 updated_at = now()
             RETURNING youtube_video_id, subtitle_download_status
             """,
@@ -274,6 +283,7 @@ class PipelineRepository:
             youtube_video_ids,
             video_urls,
             titles,
+            published_at,
         )
         return {
             row["youtube_video_id"]: SubtitleDownloadStatus(
@@ -335,7 +345,8 @@ class PipelineRepository:
                           AND youtube_video_id = ANY($2::text[])
                       )
                   )
-                ORDER BY subtitle_download_status ASC,
+                ORDER BY published_at DESC NULLS LAST,
+                         subtitle_download_status ASC,
                          subtitle_checked_at ASC NULLS FIRST,
                          created_at ASC,
                          id ASC
@@ -520,7 +531,7 @@ class PipelineRepository:
                     description = EXCLUDED.description,
                     video_url = EXCLUDED.video_url,
                     duration_seconds = EXCLUDED.duration_seconds,
-                    published_at = EXCLUDED.published_at,
+                    published_at = COALESCE(EXCLUDED.published_at, videos.published_at),
                     downloaded_at = COALESCE(EXCLUDED.downloaded_at, videos.downloaded_at),
                     subtitle_status = CASE
                         WHEN EXCLUDED.subtitle_status = 'unavailable'
@@ -659,7 +670,8 @@ class PipelineRepository:
                     AND latest_subtitle.translated_language_code IS NOT NULL
                 )
               )
-            ORDER BY video.created_at ASC,
+            ORDER BY video.published_at DESC NULLS LAST,
+                     video.created_at ASC,
                      video.id ASC
             LIMIT $8::integer
             """,
@@ -972,6 +984,7 @@ class PipelineRepository:
                     analysis.video_id,
                     video.youtube_video_id,
                     video.video_url,
+                    video.published_at,
                     analysis.analyzed_at,
                     analysis.created_at,
                     EXISTS (
@@ -1025,6 +1038,7 @@ class PipelineRepository:
                     analysis.video_id,
                     video.youtube_video_id,
                     video.video_url,
+                    video.published_at,
                     analysis.analyzed_at,
                     analysis.created_at,
                     false AS requires_reconciliation
@@ -1109,7 +1123,10 @@ class PipelineRepository:
             SELECT video_analysis_id, youtube_video_id, video_url,
                    requires_reconciliation
             FROM eligible
-            ORDER BY analyzed_at ASC, created_at ASC, video_analysis_id ASC
+            ORDER BY published_at DESC NULLS LAST,
+                     analyzed_at ASC,
+                     created_at ASC,
+                     video_analysis_id ASC
             """,
             target_key,
         )

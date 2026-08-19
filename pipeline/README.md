@@ -203,7 +203,7 @@ pipeline/.venv/bin/python pipeline/main.py analyze --limit 20 --force
 
 `analyze`、`run` 和 `video` 只提交成功的 analysis revision，不访问 BBS。分析事务同时把当次
 简体中文翻译保存为 `video_analyses.translated_subtitle_snapshot` 不可变快照，后续字幕翻译更新不会
-改变该 revision 的发布内容。只有独立 `push` 命令会访问 bbs-go：它按成功分析的先后顺序消费，
+改变该 revision 的发布内容。只有独立 `push` 命令会访问 bbs-go：它优先消费发布日期较新的视频，
 每次启动只处理单次数据库查询得到的有限快照，不会追赶运行期间并发写入的新 revision；
 并在首次消费时从已持久化的分析、翻译快照、原字幕和视频元数据构建 `topic`、`translation`、
 `source` 三步不可变 outbox，再依次执行。主题正文以摘要开头，然后是视频信息和 AI 分析；
@@ -251,7 +251,7 @@ outbox 仍会恢复，不受上述首次入队条件限制。同一视频和目�
 首次回填完成后，普通运行按 Uploads playlist 从最新视频向后扫描，遇到本轮启动前数据库中
 已有的 YouTube video ID 就停止；无需再次枚举频道全部历史。这里所有已登记视频都是可信
 边界，无论 `subtitle_download_status` 为 `0`、`1` 还是 `2`。状态 `2` 的字幕任务仍由全局
-队列在待下载任务之后重试，不依赖频道发现再次越过该视频。增量模式以已知边界为准，即使
+队列按视频发布日期倒序消费；同一发布日期内待下载任务优先于历史失败重试，不依赖频道发现再次越过该视频。增量模式以已知边界为准，即使
 设置了正数 `--max-videos-per-channel`，也会先扫描完边界前的全部新增视频。
 
 `--force` 不在已知 video ID 处停止：不限量时重新枚举完整 Uploads playlist，显式设置正数
@@ -265,8 +265,9 @@ outbox 仍会恢复，不受上述首次入队条件限制。同一视频和目�
 保持逐视频执行，避免同时启动多个 Codex 任务造成额外资源压力。
 
 频道索引发现后先把视频引用写入 PostgreSQL，再生成一次固定的全局下载队列。数值字段
-`videos.subtitle_download_status` 使用 `0=待下载`、`1=已下载`、`2=下载失败`：所有 `0`
-排在历史 `2` 前面；单视频失败会保存错误、继续后续任务，并只在下一次启动时于队尾重试。
+`videos.subtitle_download_status` 使用 `0=待下载`、`1=已下载`、`2=下载失败`：所有下载、分析和发布
+候选均先按视频发布日期倒序处理，缺失日期排在最后；同一发布日期内下载状态 `0` 排在历史 `2`
+前面。单视频失败会保存错误、继续后续任务，并只在下一次启动时重试。
 一次运行不会重新读取队列，因此本轮失败不会立即反复执行。即使
 `--max-videos-per-channel` 限制了本轮频道发现范围，该频道以前遗留的 `0` 和 `2` 仍会恢复。
 
@@ -305,8 +306,8 @@ revision 的视频。失败或取消的分析可在下一轮恢复。
 前仍须显式运行 `./db/migrate.sh`。
 
 `014_analysis_translation_snapshot.sql` 为 `video_analyses` 增加不可变的中文翻译字幕快照、
-回填可靠匹配的历史 revision，并增加按分析时间顺序消费的发布索引。新分析必须保存
-非空快照。
+回填可靠匹配的历史 revision。新分析必须保存非空快照。`015_prioritize_video_publication_date.sql`
+重建发布日期和字幕下载队列索引，使全部工作队列按发布日期倒序消费。
 
 ## 字幕选择与处理
 

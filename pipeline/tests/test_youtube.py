@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -396,6 +397,7 @@ async def test_unlimited_channel_discovery_deduplicates_video_references(
                 "id": "video-one",
                 "url": "https://www.youtube.com/watch?v=video-one",
                 "title": "Video One",
+                "timestamp": 1_754_006_400,
             },
             {
                 "id": "video-one",
@@ -421,6 +423,10 @@ async def test_unlimited_channel_discovery_deduplicates_video_references(
         ("video-two", "https://www.youtube.com/watch?v=video-two"),
     ]
     assert [reference.title for reference in result.references] == ["Video One", None]
+    assert [reference.published_at for reference in result.references] == [
+        datetime(2025, 8, 1, tzinfo=UTC),
+        None,
+    ]
     assert result.source_exhausted is True
     assert result.stopped_at_known is False
     options, url, download, process = FakeYoutubeDL.calls[0]

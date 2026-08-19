@@ -76,6 +76,7 @@ class VideoReference:
     youtube_video_id: str
     video_url: str
     title: str | None = None
+    published_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

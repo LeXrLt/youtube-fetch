@@ -15,7 +15,7 @@ test("requires the configured route key", async ({ request }) => {
   expect(protectedResponse.status()).toBe(200);
 });
 
-test("opens a full transcript from the 100-character feed preview", async ({ page }) => {
+test("opens a full transcript from the paragraph-aware feed preview", async ({ page }) => {
   await page.goto(withWebBasePath("/"));
 
   await expect(page.getByRole("heading", { name: "首页", level: 1 })).toBeVisible();
@@ -24,10 +24,7 @@ test("opens a full transcript from the 100-character feed preview", async ({ pag
   await expect(firstPost.getByText("中文", { exact: true })).toBeVisible();
 
   const preview = (await firstPost.locator(".transcript-preview").textContent()) ?? "";
-  expect(Array.from(preview).length).toBeLessThanOrEqual(101);
-  if (preview.endsWith("…")) {
-    expect(Array.from(preview)).toHaveLength(101);
-  }
+  expect(Array.from(preview).length).toBeLessThanOrEqual(800);
   await expect(firstPost.getByRole("button", { name: "展开全文" })).toHaveCount(0);
 
   const detailLink = firstPost.locator(".post-detail-link");
@@ -47,10 +44,9 @@ test("opens a full transcript from the 100-character feed preview", async ({ pag
   const fullTranscript =
     (await page.locator(".post-detail-transcript").textContent()) ?? "";
   const normalizedFullTranscript = fullTranscript.replace(/\s+/g, " ").trim();
-  const previewText = preview.endsWith("…")
-    ? Array.from(preview).slice(0, 100).join("")
-    : preview;
-  expect(normalizedFullTranscript.startsWith(previewText)).toBe(true);
+  const previewText = preview.endsWith("…") ? Array.from(preview).slice(0, -1).join("") : preview;
+  const normalizedPreview = previewText.replace(/\s+/g, " ").trim();
+  expect(normalizedFullTranscript.startsWith(normalizedPreview)).toBe(true);
   const analysisRail = page.getByRole("complementary", { name: "AI 分析" });
   await expect(analysisRail).toBeVisible();
 

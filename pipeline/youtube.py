@@ -349,6 +349,7 @@ class YoutubeClient:
                             if isinstance(title, str) and title.strip()
                             else None
                         ),
+                        published_at=_published_at(entry),
                     )
                 )
         return VideoDiscoveryResult(

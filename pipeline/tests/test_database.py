@@ -281,16 +281,19 @@ async def test_repository_persists_and_orders_subtitle_download_queue(
             "queue-failed-old",
             "https://www.youtube.com/watch?v=queue-failed-old",
             "Old failure title",
+            datetime(2026, 8, 1, tzinfo=UTC),
         ),
         VideoReference(
             "queue-failed-new",
             "https://www.youtube.com/watch?v=queue-failed-new",
             "New failure title",
+            datetime(2026, 8, 4, tzinfo=UTC),
         ),
         VideoReference(
             "queue-complete",
             "https://www.youtube.com/watch?v=queue-complete",
             "Complete title",
+            datetime(2026, 8, 2, tzinfo=UTC),
         ),
     ]
     assert await repository.enqueue_subtitle_downloads(
@@ -307,6 +310,7 @@ async def test_repository_persists_and_orders_subtitle_download_queue(
                 "queue-pending",
                 "https://www.youtube.com/watch?v=queue-pending",
                 "Pending title",
+                datetime(2026, 8, 3, tzinfo=UTC),
             )
         ],
     ) == {"queue-pending": SubtitleDownloadStatus.PENDING}
@@ -381,15 +385,13 @@ async def test_repository_persists_and_orders_subtitle_download_queue(
         [second_channel_id, first_channel_id],
         ["queue-complete"],
     )
-    assert [task.youtube_video_id for task in candidates][-2:] == [
-        "queue-failed-old",
+    assert [task.youtube_video_id for task in candidates] == [
         "queue-failed-new",
-    ]
-    assert {task.youtube_video_id for task in candidates[:-2]} == {
         "queue-pending",
         "queue-complete",
-    }
-    assert candidates[-2].status is SubtitleDownloadStatus.FAILED
+        "queue-failed-old",
+    ]
+    assert candidates[0].status is SubtitleDownloadStatus.FAILED
     assert candidates[-1].status is SubtitleDownloadStatus.FAILED
     assert {task.youtube_video_id: task.title for task in candidates} == {
         "queue-pending": "Pending title",
@@ -566,13 +568,6 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
     await add_analysis(running_ids, "running")
     await add_analysis(cancelled_ids, "cancelled")
 
-    sortable_candidates = [
-        pending_ids,
-        recoverable_ids,
-        failed_ids,
-        running_ids,
-        cancelled_ids,
-    ]
     all_video_ids = [
         pending_ids[0],
         matched_ids[0],
@@ -585,30 +580,30 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
     await pool.execute(
         """
         UPDATE videos
-        SET created_at = '2026-08-03 00:00:00+00'::timestamptz
-        WHERE id = ANY($1::uuid[])
+        SET created_at = '2026-08-03 00:00:00+00'::timestamptz,
+            published_at = CASE id
+                WHEN $1 THEN '2026-08-01 00:00:00+00'::timestamptz
+                WHEN $2 THEN '2026-08-05 00:00:00+00'::timestamptz
+                WHEN $3 THEN '2026-08-03 00:00:00+00'::timestamptz
+                WHEN $4 THEN '2026-08-02 00:00:00+00'::timestamptz
+                WHEN $5 THEN '2026-08-04 00:00:00+00'::timestamptz
+                ELSE NULL
+            END
+        WHERE id = ANY($6::uuid[])
         """,
+        pending_ids[0],
+        recoverable_ids[0],
+        failed_ids[0],
+        running_ids[0],
+        cancelled_ids[0],
         all_video_ids,
     )
     expected_ids = [
-        youtube_video_id
-        for _, youtube_video_id in sorted(
-            (
-                (video_id, f"candidate-{state}")
-                for (video_id, _), state in zip(
-                    sortable_candidates,
-                    (
-                        "pending",
-                        "missing-translation",
-                        "failed",
-                        "running",
-                        "cancelled",
-                    ),
-                    strict=True,
-                )
-            ),
-            key=lambda item: item[0],
-        )
+        "candidate-missing-translation",
+        "candidate-cancelled",
+        "candidate-failed",
+        "candidate-running",
+        "candidate-pending",
     ]
 
     candidates = await repository.list_analysis_candidates(
@@ -838,6 +833,19 @@ async def test_repository_publication_queue_is_fifo_per_video_and_requeues_uncer
     assert first_subtitle_id is not None
     assert second_subtitle_id is not None
     pool = repository._require_pool()
+    await pool.execute(
+        """
+        UPDATE videos
+        SET published_at = CASE id
+            WHEN $1 THEN '2026-08-01 00:00:00+00'::timestamptz
+            WHEN $2 THEN '2026-08-02 00:00:00+00'::timestamptz
+        END
+        WHERE id = ANY($3::uuid[])
+        """,
+        first_video_id,
+        second_video_id,
+        [first_video_id, second_video_id],
+    )
 
     async def add_succeeded_revision(
         video_id: UUID,
@@ -917,9 +925,9 @@ async def test_repository_publication_queue_is_fifo_per_video_and_requeues_uncer
         second_video.video_url,
     )
     assert await repository.list_publication_candidates(target_key) == [
+        expected_second,
         expected_oldest,
         expected_newer,
-        expected_second,
     ]
     await pool.execute(
         "UPDATE video_analyses SET raw_agent_output = '{}'::jsonb WHERE id = $1",
@@ -1005,8 +1013,8 @@ async def test_repository_publication_queue_is_fifo_per_video_and_requeues_uncer
             response_metadata={},
         )
     assert await repository.list_publication_candidates(target_key) == [
-        expected_newer,
         expected_second,
+        expected_newer,
     ]
 
     await repository.ensure_publication_steps(
@@ -1036,8 +1044,8 @@ async def test_repository_publication_queue_is_fifo_per_video_and_requeues_uncer
         requires_reconciliation=True,
     )
     assert await repository.list_publication_candidates(target_key) == [
-        expected_uncertain,
         expected_second,
+        expected_uncertain,
     ]
 
     legacy_video = replace(
@@ -1081,14 +1089,14 @@ async def test_repository_publication_queue_is_fifo_per_video_and_requeues_uncer
     ]
     await repository.ensure_publication_steps(legacy_analysis_id, legacy_steps)
     assert await repository.list_publication_candidates(legacy_target) == [
+        expected_second,
+        expected_oldest,
+        expected_newer,
         PublicationCandidate(
             legacy_analysis_id,
             legacy_video.youtube_video_id,
             legacy_video.video_url,
         ),
-        expected_oldest,
-        expected_newer,
-        expected_second,
     ]
 
 

@@ -4,7 +4,10 @@ import Link from "next/link";
 import { Avatar } from "@/components/avatar";
 import { formatDuration, formatPostDate } from "@/lib/post-format";
 import { safeHttpUrl } from "@/lib/public-url";
-import { buildTranscriptPreview } from "@/lib/transcript-preview";
+import {
+  TRANSCRIPT_PREVIEW_ELLIPSIS,
+  buildTranscriptPreview,
+} from "@/lib/transcript-preview";
 
 export type TranscriptPostView = {
   videoId: string;
@@ -108,7 +111,9 @@ export function TranscriptPost({
 
         <p className="transcript-copy transcript-preview">
           {preview.text}
-          {preview.isTruncated ? <span aria-hidden="true">…</span> : null}
+          {preview.isTruncated ? (
+            <span aria-hidden="true">{TRANSCRIPT_PREVIEW_ELLIPSIS}</span>
+          ) : null}
         </p>
 
         {videoUrl ? (

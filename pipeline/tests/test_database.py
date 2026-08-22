@@ -8,7 +8,7 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
@@ -281,19 +281,31 @@ async def test_repository_persists_and_orders_subtitle_download_queue(
             "queue-failed-old",
             "https://www.youtube.com/watch?v=queue-failed-old",
             "Old failure title",
-            datetime(2026, 8, 1, tzinfo=UTC),
+            datetime.now(UTC) - timedelta(days=4),
         ),
         VideoReference(
             "queue-failed-new",
             "https://www.youtube.com/watch?v=queue-failed-new",
             "New failure title",
-            datetime(2026, 8, 4, tzinfo=UTC),
+            datetime.now(UTC) - timedelta(days=1),
         ),
         VideoReference(
             "queue-complete",
             "https://www.youtube.com/watch?v=queue-complete",
             "Complete title",
-            datetime(2026, 8, 2, tzinfo=UTC),
+            datetime.now(UTC) - timedelta(days=3),
+        ),
+        VideoReference(
+            "queue-expired",
+            "https://www.youtube.com/watch?v=queue-expired",
+            "Expired title",
+            datetime.now(UTC) - timedelta(days=31),
+        ),
+        VideoReference(
+            "queue-future",
+            "https://www.youtube.com/watch?v=queue-future",
+            "Future title",
+            datetime.now(UTC) + timedelta(days=1),
         ),
     ]
     assert await repository.enqueue_subtitle_downloads(
@@ -302,6 +314,8 @@ async def test_repository_persists_and_orders_subtitle_download_queue(
         "queue-failed-old": SubtitleDownloadStatus.PENDING,
         "queue-failed-new": SubtitleDownloadStatus.PENDING,
         "queue-complete": SubtitleDownloadStatus.PENDING,
+        "queue-expired": SubtitleDownloadStatus.PENDING,
+        "queue-future": SubtitleDownloadStatus.PENDING,
     }
     assert await repository.enqueue_subtitle_downloads(
         second_channel_id,
@@ -310,7 +324,7 @@ async def test_repository_persists_and_orders_subtitle_download_queue(
                 "queue-pending",
                 "https://www.youtube.com/watch?v=queue-pending",
                 "Pending title",
-                datetime(2026, 8, 3, tzinfo=UTC),
+                datetime.now(UTC) - timedelta(days=2),
             )
         ],
     ) == {"queue-pending": SubtitleDownloadStatus.PENDING}
@@ -344,6 +358,8 @@ async def test_repository_persists_and_orders_subtitle_download_queue(
             "queue-failed-old",
             "queue-failed-new",
             "queue-complete",
+            "queue-expired",
+            "queue-future",
         },
     }
     assert await repository.list_known_video_ids([]) == {}
@@ -383,7 +399,7 @@ async def test_repository_persists_and_orders_subtitle_download_queue(
 
     candidates = await repository.list_subtitle_download_candidates(
         [second_channel_id, first_channel_id],
-        ["queue-complete"],
+        ["queue-complete", "queue-expired", "queue-future"],
     )
     assert [task.youtube_video_id for task in candidates] == [
         "queue-failed-new",
@@ -490,6 +506,9 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
     failed_ids = await save_video("candidate-failed", "Failed analysis")
     running_ids = await save_video("candidate-running", "Running analysis")
     cancelled_ids = await save_video("candidate-cancelled", "Cancelled analysis")
+    expired_ids = await save_video("candidate-expired", "Expired analysis")
+    future_ids = await save_video("candidate-future", "Future analysis")
+    await save_video("candidate-undated", "Undated analysis")
     invalid_ids = await save_video("candidate-invalid", "Older valid subtitle")
     _, latest_invalid_subtitle_id = await save_video("candidate-invalid", None)
 
@@ -575,6 +594,8 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
         failed_ids[0],
         running_ids[0],
         cancelled_ids[0],
+        expired_ids[0],
+        future_ids[0],
         invalid_ids[0],
     ]
     await pool.execute(
@@ -582,20 +603,26 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
         UPDATE videos
         SET created_at = '2026-08-03 00:00:00+00'::timestamptz,
             published_at = CASE id
-                WHEN $1 THEN '2026-08-01 00:00:00+00'::timestamptz
-                WHEN $2 THEN '2026-08-05 00:00:00+00'::timestamptz
-                WHEN $3 THEN '2026-08-03 00:00:00+00'::timestamptz
-                WHEN $4 THEN '2026-08-02 00:00:00+00'::timestamptz
-                WHEN $5 THEN '2026-08-04 00:00:00+00'::timestamptz
+                WHEN $1 THEN now() - INTERVAL '5 days'
+                WHEN $2 THEN now() - INTERVAL '1 day'
+                WHEN $3 THEN now() - INTERVAL '3 days'
+                WHEN $4 THEN now() - INTERVAL '4 days'
+                WHEN $5 THEN now() - INTERVAL '2 days'
+                WHEN $6 THEN now() - INTERVAL '31 days'
+                WHEN $7 THEN now() + INTERVAL '1 day'
+                WHEN $8 THEN now() - INTERVAL '6 days'
                 ELSE NULL
             END
-        WHERE id = ANY($6::uuid[])
+        WHERE id = ANY($9::uuid[])
         """,
         pending_ids[0],
         recoverable_ids[0],
         failed_ids[0],
         running_ids[0],
         cancelled_ids[0],
+        expired_ids[0],
+        future_ids[0],
+        matched_ids[0],
         all_video_ids,
     )
     expected_ids = [
@@ -614,6 +641,11 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
     assert [candidate.youtube_video_id for candidate in candidates] == expected_ids
     assert "candidate-missing-translation" in expected_ids
     assert "candidate-matched" not in expected_ids
+    assert {
+        "candidate-expired",
+        "candidate-future",
+        "candidate-undated",
+    }.isdisjoint(candidate.youtube_video_id for candidate in candidates)
     assert candidates == [
         VideoReference(
             youtube_video_id=youtube_video_id,
@@ -681,6 +713,11 @@ async def test_repository_lists_stable_analysis_candidate_snapshot(
     assert "candidate-invalid" not in {
         candidate.youtube_video_id for candidate in forced_candidates
     }
+    assert {
+        "candidate-expired",
+        "candidate-future",
+        "candidate-undated",
+    }.isdisjoint(candidate.youtube_video_id for candidate in forced_candidates)
 
 
 @pytest.mark.asyncio
@@ -837,8 +874,8 @@ async def test_repository_publication_queue_is_fifo_per_video_and_requeues_uncer
         """
         UPDATE videos
         SET published_at = CASE id
-            WHEN $1 THEN '2026-08-01 00:00:00+00'::timestamptz
-            WHEN $2 THEN '2026-08-02 00:00:00+00'::timestamptz
+            WHEN $1 THEN now() - INTERVAL '2 days'
+            WHEN $2 THEN now() - INTERVAL '1 day'
         END
         WHERE id = ANY($3::uuid[])
         """,
@@ -1053,6 +1090,7 @@ async def test_repository_publication_queue_is_fifo_per_video_and_requeues_uncer
         youtube_video_id="publication-queue-legacy",
         title="Legacy publication queue video",
         video_url="https://www.youtube.com/watch?v=publication-queue-legacy",
+        published_at=datetime.now(UTC) - timedelta(days=31),
     )
     legacy_video_id, _ = await repository.save_fetched_video(legacy_video, None)
     await pool.execute(
@@ -1092,11 +1130,6 @@ async def test_repository_publication_queue_is_fifo_per_video_and_requeues_uncer
         expected_second,
         expected_oldest,
         expected_newer,
-        PublicationCandidate(
-            legacy_analysis_id,
-            legacy_video.youtube_video_id,
-            legacy_video.video_url,
-        ),
     ]
 
 
@@ -2058,6 +2091,7 @@ async def test_repository_treats_missing_fetched_subtitle_as_pending(
         ),
         title="Missing Subtitle Video",
         video_url="https://www.youtube.com/watch?v=missing-subtitle-video",
+        published_at=datetime.now(UTC) - timedelta(days=1),
     )
     subtitle = DownloadedSubtitle(
         language_code="en",

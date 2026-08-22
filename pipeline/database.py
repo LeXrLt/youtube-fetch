@@ -338,6 +338,8 @@ class PipelineRepository:
                        subtitle_download_status
                 FROM videos
                 WHERE channel_id = ANY($1::uuid[])
+                  AND published_at > now() - INTERVAL '30 days'
+                  AND published_at <= now()
                   AND (
                       subtitle_download_status IN (0, 2)
                       OR (
@@ -645,7 +647,9 @@ class PipelineRepository:
                          subtitle.id DESC
                 LIMIT 1
             ) AS latest_subtitle ON true
-            WHERE latest_subtitle.normalized_text IS NOT NULL
+            WHERE video.published_at > now() - INTERVAL '30 days'
+              AND video.published_at <= now()
+              AND latest_subtitle.normalized_text IS NOT NULL
               AND (
                 $7::boolean
                 OR NOT EXISTS (
@@ -1123,6 +1127,8 @@ class PipelineRepository:
             SELECT video_analysis_id, youtube_video_id, video_url,
                    requires_reconciliation
             FROM eligible
+            WHERE published_at > now() - INTERVAL '30 days'
+              AND published_at <= now()
             ORDER BY published_at DESC NULLS LAST,
                      analyzed_at ASC,
                      created_at ASC,

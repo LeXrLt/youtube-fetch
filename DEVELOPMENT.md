@@ -196,10 +196,11 @@ pipeline/.venv/bin/python pipeline/main.py push --limit 20
 
 Pipeline 先把发现的视频引用幂等登记到 `videos`，再一次性读取所选频道的全局下载候选快照。
 `subtitle_download_status` 是独立的数值调度状态：`0` 表示待下载，`1` 表示
-下载检查完成，`2` 表示下载失败。下载、分析和发布队列均先按视频发布日期倒序处理，缺失日期排在
-最后；同一发布日期内下载队列先调度 `0`，再按失败检查时间调度历史 `2`；本轮
-新失败只写入状态和错误信息，不重新查询或重新入队，因此会继续处理后续任务并在下次启动时
-排到待下载任务之后重试。`unavailable` 和 `invalid` 仍保留在原有 `subtitle_status` 中，且
+下载检查完成，`2` 表示下载失败。下载、分析和发布队列均只处理过去 30 天内已发布的视频，并按
+发布日期倒序处理；发布日期缺失、发布超过 30 天或发布日期在未来的视频不进入队列。同一发布
+日期内下载队列先调度 `0`，再按失败检查时间调度历史 `2`；本轮
+新失败只写入状态和错误信息，不重新查询或重新入队，因此会继续处理后续任务，并在仍处于 30 天
+窗口时于下次启动重试。`unavailable` 和 `invalid` 仍保留在原有 `subtitle_status` 中，且
 对应数值状态 `1`，避免把“确认无字幕”或“已下载但无法规范化”误当成传输失败反复抓取。
 有效规范化简体中文字幕在保存字幕的同一事务中将 `normalized_text` 原样复制到
 `translated_text`，同时写入源语言和 `copied_chinese_source` 元数据，不等待 `analyze`，
@@ -209,7 +210,8 @@ Pipeline 先把发现的视频引用幂等登记到 `videos`，再一次性读�
 
 分析和发布以成功 analysis revision 为边界解耦。`complete_analysis_run` 只在分析事务中写入
 结果和不可变 `translated_subtitle_snapshot`，不构建 outbox、不访问 bbs-go。独立 `push`
-启动时通过单次查询固定本轮候选快照，优先消费发布日期较新的视频；运行期间新增的 revision 留给
+启动时通过单次查询固定本轮候选快照，只消费过去 30 天内已发布的视频，并优先消费发布日期较新
+的视频；运行期间新增的 revision 留给
 下一轮。首次消费时才由持久化 revision 构建 `topic`、`translation`、`source`
 的不可变 Markdown outbox，再依次写入“AI 分析主题、中文翻译一级评论、原文字幕一级评论”
 并逐步回读验证。主题正文以摘要开头。源语言经
@@ -223,7 +225,7 @@ trim、下划线转连字符和大小写规范化后，仅 `zh`、`zh-Hans`、`z
 远程 GET 可有限重试，非幂等 POST 不自动重试。只完成本地领取的 `claimed` 可安全重领，
 `created` 状态可依照已保存远程 ID 恢复回读，明确未写入的 `failed` 状态可再次执行；真正开始
 POST 后中断或传输结果不明会进入 `uncertain`，必须人工检查
-远程主题或评论，不能自动重放。这不是 exactly-once 协议。已有未完成 outbox 总是恢复；
+远程主题或评论，不能自动重放。这不是 exactly-once 协议。仍处于 30 天窗口的未完成 outbox 总是恢复；
 预存 `uncertain` 或遗留 `in_progress` 会作为失败诊断输出、使 CLI 返回非零并阻塞同视频后续
 revision，但不占正数 `--limit` 的新发布额度，因此其他视频仍能继续。正数 limit 约束的是本轮
 可自动推进的候选数，JSON 结果数可能因这些诊断而更大。
@@ -294,7 +296,8 @@ revision，但不占正数 `--limit` 的新发布额度，因此其他视频仍�
   快照及状态，禁止修改目标与内容快照，并为待恢复步骤建立部分索引。
 - `014` 增加 `video_analyses.translated_subtitle_snapshot`，在元数据能证明翻译身份一致时
   回填历史成功分析，并强制新快照非空且不可变。
-- `015` 使下载、分析和发布队列均按视频发布日期倒序消费，并重建对应排序索引。
+- `015` 使下载、分析和发布队列均按发布日期倒序消费，并重建对应排序索引；Pipeline 候选查询
+  另行把三个队列限制在过去 30 天内已发布的视频。
 
 完整 Agent 输出保存在 `video_analyses.raw_agent_output` JSONB，以允许 Schema 演进；
 稳定查询字段通过 `pipeline/config/pipeline.toml` 中的 JSON Pointer 投影到关系字段。
